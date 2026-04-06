@@ -4,50 +4,38 @@
 #define SYS_CLK             48000000
 #define FREQUENCY_HZ        67000
 #define HSE_EXT             1
-
-#define AMP_MODE            1   /* 0 = OFF (LOW), 1 = ON (HIGH)                        */
-#define CLK_MODE            2   /* 0 = OFF (LOW), 1 = ON (HIGH), 2 = toggle            */
-#define BUZZER_MODE         2   /* 0 = OFF,       1 = ON,        2 = on when detected  */
-
-/* Detection parameters (only used when BUZZER_MODE == 2) */
-#define DIST_MIN_CM         50
-#define DIST_MAX_CM         250
-#define PULSE_COUNT         11
-#define BLANK_CYCLES        100
+#define PA6_PULSE_COUNT     4
+#define AMP_BLANK_CYCLES    100
 #define FREQ_TOLERANCE_PCT  15
-#define TRIGGER_RATE_HZ     20
+#define DIST_MIN_CM         100
+#define DIST_MAX_CM         200
+#define LISTEN_DISTANCE_CM  250
+#define TRIGGER_RATE_HZ     10
 #define REQUIRED_PULSES     3
-#define LED_ON_TIME_MS      100
 
 /*______________AUTO-CALCULATED______________*/
-#define TARGET_PERIOD       (SYS_CLK / FREQUENCY_HZ)
-
-#if (BUZZER_MODE == 2)
 #define TIM3_PRESCALER      15
 #define TIM3_TICK_HZ        (SYS_CLK / (TIM3_PRESCALER + 1))
+#define TARGET_PERIOD       (SYS_CLK / FREQUENCY_HZ)
 #define TICKS_PER_METRE     (TIM3_TICK_HZ * 2UL / 343UL)
 #define DIST_MIN_TICKS      (TICKS_PER_METRE * DIST_MIN_CM / 100UL)
 #define DIST_MAX_TICKS      (TICKS_PER_METRE * DIST_MAX_CM / 100UL)
 #define FREQ_MIN_PERIOD     (TIM3_TICK_HZ / (FREQUENCY_HZ * (100 + FREQ_TOLERANCE_PCT) / 100))
 #define FREQ_MAX_PERIOD     (TIM3_TICK_HZ / (FREQUENCY_HZ * (100 - FREQ_TOLERANCE_PCT) / 100))
-#define LISTEN_CYCLES       ((DIST_MAX_TICKS + (TICKS_PER_METRE * 50 / 100)) * FREQUENCY_HZ / TIM3_TICK_HZ)
+#define LISTEN_CYCLES       ((TICKS_PER_METRE * LISTEN_DISTANCE_CM / 100UL) * FREQUENCY_HZ / TIM3_TICK_HZ)
+#define LED_ON_TIME         (TRIGGER_RATE_HZ * 1)
 #define TIM14_ARR           (1000 / TRIGGER_RATE_HZ - 1)
 
-static volatile uint8_t  pulse_active;
-static volatile uint8_t  edge_count;
-static volatile uint8_t  trigger_pending;
-static volatile uint8_t  amp_blanked;
-static volatile uint8_t  amp_blank_count;
+static volatile uint8_t  pulse_active, edge_count, trigger_pending;
+static volatile uint8_t  amp_blanked, amp_blank_count;
 static volatile uint8_t  listen_active;
 static volatile uint16_t listen_count;
-static volatile uint32_t pulse_start_time;
+static volatile uint32_t pa6_start_time;
 static volatile uint8_t  tof_armed;
-static volatile uint32_t last_capture;
-static volatile uint8_t  has_previous;
-static volatile uint8_t  valid_pulse_count;
+static volatile uint32_t pb1_last_capture;
+static volatile uint8_t  pb1_has_previous, pb1_valid_pulse_count;
 static volatile uint8_t  led_on_flag;
-static volatile uint16_t led_timer;
-#endif
+static volatile uint16_t led_timer_count;
 
 
 #ifdef HSE_EXT
@@ -84,39 +72,36 @@ void SystemClock_Config(void)
 }
 #endif
 
-
-#if (BUZZER_MODE == 2)
-
 void TIM1_CC_IRQHandler(void)
 {
     if (!LL_TIM_IsActiveFlag_CC2(TIM1)) return;
     LL_TIM_ClearFlag_CC2(TIM1);
 
-    if (trigger_pending && !pulse_active && !amp_blanked && !listen_active)
+    if (trigger_pending & !pulse_active & !amp_blanked & !listen_active)
     {
         LL_TIM_OC_SetMode(TIM3, LL_TIM_CHANNEL_CH1, LL_TIM_OCMODE_FORCED_ACTIVE);
         GPIOA->BRR = LL_GPIO_PIN_2;
 
-        pulse_start_time    = TIM3->CNT;
-        tof_armed           = 1;
-        pulse_active        = 1;
-        amp_blanked         = 1;
-        listen_active       = 1;
-        edge_count          = 0;
-        amp_blank_count     = 0;
-        listen_count        = 0;
-        has_previous        = 0;
-        valid_pulse_count   = 0;
-        trigger_pending     = 0;
+        pa6_start_time        = TIM3->CNT;
+        tof_armed             = 1;
+        pulse_active          = 1;
+        amp_blanked           = 1;
+        listen_active         = 1;
+        edge_count            = 0;
+        amp_blank_count       = 0;
+        listen_count          = 0;
+        pb1_has_previous      = 0;
+        pb1_valid_pulse_count = 0;
+        trigger_pending       = 0;
     }
 
-    if (pulse_active && ++edge_count >= PULSE_COUNT)
+    if (pulse_active && ++edge_count >= PA6_PULSE_COUNT)
     {
         LL_TIM_OC_SetMode(TIM3, LL_TIM_CHANNEL_CH1, LL_TIM_OCMODE_FORCED_INACTIVE);
         pulse_active = 0;
     }
 
-    if (amp_blanked && ++amp_blank_count >= BLANK_CYCLES)
+    if (amp_blanked && ++amp_blank_count >= AMP_BLANK_CYCLES)
     {
         GPIOA->BSRR = LL_GPIO_PIN_2;
         amp_blanked = 0;
@@ -136,7 +121,7 @@ void TIM14_IRQHandler(void)
 
     trigger_pending = 1;
 
-    if (led_timer && !--led_timer)
+    if (led_timer_count && !--led_timer_count)
         led_on_flag = 0;
 }
 
@@ -149,45 +134,42 @@ void TIM3_IRQHandler(void)
 
     uint32_t cap = TIM3->CCR4;
 
-    if (!has_previous)
+    if (!pb1_has_previous)
     {
-        last_capture = cap;
-        has_previous = 1;
+        pb1_last_capture = cap;
+        pb1_has_previous = 1;
         return;
     }
 
-    uint32_t period = (cap >= last_capture)
-        ? cap - last_capture
-        : 65536UL - last_capture + cap;
-    last_capture = cap;
+    uint32_t period = (cap >= pb1_last_capture)
+        ? cap - pb1_last_capture
+        : 65536UL - pb1_last_capture + cap;
+    pb1_last_capture = cap;
 
     if (period < FREQ_MIN_PERIOD || period > FREQ_MAX_PERIOD)
     {
-        valid_pulse_count = 0;
+        pb1_valid_pulse_count = 0;
         return;
     }
 
-    uint32_t tof = (cap >= pulse_start_time)
-        ? cap - pulse_start_time
-        : 65536UL - pulse_start_time + cap;
+    uint32_t tof = (cap >= pa6_start_time)
+        ? cap - pa6_start_time
+        : 65536UL - pa6_start_time + cap;
 
     if (tof >= DIST_MIN_TICKS && tof <= DIST_MAX_TICKS)
     {
-        if (++valid_pulse_count >= REQUIRED_PULSES)
+        if (++pb1_valid_pulse_count >= REQUIRED_PULSES)
         {
-            led_on_flag       = 1;
-            led_timer         = (LED_ON_TIME_MS * TRIGGER_RATE_HZ) / 1000;
-            valid_pulse_count = 0;
+            led_on_flag           = 1;
+            led_timer_count       = LED_ON_TIME;
+            pb1_valid_pulse_count = 0;
         }
     }
     else
     {
-        valid_pulse_count = 0;
+        pb1_valid_pulse_count = 0;
     }
 }
-
-#endif /* BUZZER_MODE == 2 */
-
 
 int main(void)
 {
@@ -198,19 +180,22 @@ int main(void)
     LL_AHB1_GRP1_EnableClock(LL_AHB1_GRP1_PERIPH_GPIOA);
     LL_AHB1_GRP1_EnableClock(LL_AHB1_GRP1_PERIPH_GPIOB);
 
-    /* PA2 — Amplifier enable */
-    LL_GPIO_SetPinMode(GPIOA, LL_GPIO_PIN_2, LL_GPIO_MODE_OUTPUT);
-#if (AMP_MODE == 1)
-    GPIOA->BSRR = LL_GPIO_PIN_2;
-#else
-    GPIOA->BRR = LL_GPIO_PIN_2;
-#endif
-
-    /* PA9 — Clock output */
-#if (CLK_MODE == 2)
     LL_GPIO_SetPinMode(GPIOA, LL_GPIO_PIN_9, LL_GPIO_MODE_ALTERNATE);
     LL_GPIO_SetAFPin_8_15(GPIOA, LL_GPIO_PIN_9, LL_GPIO_AF_2);
     LL_GPIO_SetPinSpeed(GPIOA, LL_GPIO_PIN_9, LL_GPIO_SPEED_FREQ_HIGH);
+
+    LL_GPIO_SetPinMode(GPIOA, LL_GPIO_PIN_6, LL_GPIO_MODE_ALTERNATE);
+    LL_GPIO_SetAFPin_0_7(GPIOA, LL_GPIO_PIN_6, LL_GPIO_AF_1);
+
+    LL_GPIO_SetPinMode(GPIOA, LL_GPIO_PIN_2, LL_GPIO_MODE_OUTPUT);
+    GPIOA->BSRR = LL_GPIO_PIN_2;
+
+    LL_GPIO_SetPinMode(GPIOA, LL_GPIO_PIN_4, LL_GPIO_MODE_OUTPUT);
+    GPIOA->BRR = LL_GPIO_PIN_4;
+
+    LL_GPIO_SetPinMode(GPIOB, LL_GPIO_PIN_1, LL_GPIO_MODE_ALTERNATE);
+    LL_GPIO_SetAFPin_0_7(GPIOB, LL_GPIO_PIN_1, LL_GPIO_AF_1);
+    LL_GPIO_SetPinPull(GPIOB, LL_GPIO_PIN_1, LL_GPIO_PULL_DOWN);
 
     LL_APB1_GRP2_EnableClock(LL_APB1_GRP2_PERIPH_TIM1);
     LL_TIM_SetPrescaler(TIM1, 0);
@@ -219,40 +204,11 @@ int main(void)
     LL_TIM_OC_SetMode(TIM1, LL_TIM_CHANNEL_CH2, LL_TIM_OCMODE_PWM1);
     LL_TIM_CC_EnableChannel(TIM1, LL_TIM_CHANNEL_CH2);
     LL_TIM_EnableAllOutputs(TIM1);
-#if (BUZZER_MODE == 2)
     LL_TIM_EnableIT_CC2(TIM1);
     NVIC_SetPriority(TIM1_CC_IRQn, 0);
     NVIC_EnableIRQ(TIM1_CC_IRQn);
-#endif
     LL_TIM_EnableCounter(TIM1);
 
-#elif (CLK_MODE == 1)
-    LL_GPIO_SetPinMode(GPIOA, LL_GPIO_PIN_9, LL_GPIO_MODE_OUTPUT);
-    GPIOA->BSRR = LL_GPIO_PIN_9;
-#else
-    LL_GPIO_SetPinMode(GPIOA, LL_GPIO_PIN_9, LL_GPIO_MODE_OUTPUT);
-    GPIOA->BRR = LL_GPIO_PIN_9;
-#endif
-
-    /* PA4 — Buzzer/LED */
-    LL_GPIO_SetPinMode(GPIOA, LL_GPIO_PIN_4, LL_GPIO_MODE_OUTPUT);
-#if (BUZZER_MODE == 1)
-    GPIOA->BSRR = LL_GPIO_PIN_4;
-#else
-    GPIOA->BRR = LL_GPIO_PIN_4;
-#endif
-
-#if (BUZZER_MODE == 2)
-    /* PA6 — TIM3_CH1 burst output */
-    LL_GPIO_SetPinMode(GPIOA, LL_GPIO_PIN_6, LL_GPIO_MODE_ALTERNATE);
-    LL_GPIO_SetAFPin_0_7(GPIOA, LL_GPIO_PIN_6, LL_GPIO_AF_1);
-
-    /* PB1 — TIM3_CH4 echo input */
-    LL_GPIO_SetPinMode(GPIOB, LL_GPIO_PIN_1, LL_GPIO_MODE_ALTERNATE);
-    LL_GPIO_SetAFPin_0_7(GPIOB, LL_GPIO_PIN_1, LL_GPIO_AF_1);
-    LL_GPIO_SetPinPull(GPIOB, LL_GPIO_PIN_1, LL_GPIO_PULL_DOWN);
-
-    /* TIM3 — burst + capture */
     LL_APB1_GRP1_EnableClock(LL_APB1_GRP1_PERIPH_TIM3);
     LL_TIM_SetPrescaler(TIM3, TIM3_PRESCALER);
     LL_TIM_SetAutoReload(TIM3, 65535);
@@ -265,23 +221,19 @@ int main(void)
     NVIC_EnableIRQ(TIM3_IRQn);
     LL_TIM_EnableCounter(TIM3);
 
-    /* TIM14 — trigger timer */
     LL_APB1_GRP1_EnableClock(LL_APB1_GRP1_PERIPH_TIM14);
     LL_TIM_SetPrescaler(TIM14, 47999);
     LL_TIM_SetAutoReload(TIM14, TIM14_ARR);
     LL_TIM_EnableIT_UPDATE(TIM14);
     NVIC_EnableIRQ(TIM14_IRQn);
     LL_TIM_EnableCounter(TIM14);
-#endif
 
     while (1)
     {
-#if (BUZZER_MODE == 2)
         if (led_on_flag)
             GPIOA->BSRR = LL_GPIO_PIN_4;
         else
             GPIOA->BRR = LL_GPIO_PIN_4;
-#endif
     }
 }
 
