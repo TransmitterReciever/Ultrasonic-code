@@ -4,14 +4,16 @@
 #define SYS_CLK             48000000
 #define FREQUENCY_HZ        67000
 #define HSE_EXT             1
-#define PA6_PULSE_COUNT     4
-#define AMP_BLANK_CYCLES    100
+
+#define DIST_MIN_CM         50
+#define DIST_MAX_CM         250
+
+#define PULSE_COUNT         11
+#define BLANK_CYCLES        100
 #define FREQ_TOLERANCE_PCT  15
-#define DIST_MIN_CM         100
-#define DIST_MAX_CM         200
-#define LISTEN_DISTANCE_CM  250
-#define TRIGGER_RATE_HZ     10
+#define TRIGGER_RATE_HZ     20
 #define REQUIRED_PULSES     3
+#define LED_ON_TIME_MS      100
 
 /*______________AUTO-CALCULATED______________*/
 #define TIM3_PRESCALER      15
@@ -22,20 +24,23 @@
 #define DIST_MAX_TICKS      (TICKS_PER_METRE * DIST_MAX_CM / 100UL)
 #define FREQ_MIN_PERIOD     (TIM3_TICK_HZ / (FREQUENCY_HZ * (100 + FREQ_TOLERANCE_PCT) / 100))
 #define FREQ_MAX_PERIOD     (TIM3_TICK_HZ / (FREQUENCY_HZ * (100 - FREQ_TOLERANCE_PCT) / 100))
-#define LISTEN_CYCLES       ((TICKS_PER_METRE * LISTEN_DISTANCE_CM / 100UL) * FREQUENCY_HZ / TIM3_TICK_HZ)
-#define LED_ON_TIME         (TRIGGER_RATE_HZ * 1)
+#define LISTEN_CYCLES       ((DIST_MAX_TICKS + (TICKS_PER_METRE * 50 / 100)) * FREQUENCY_HZ / TIM3_TICK_HZ)
 #define TIM14_ARR           (1000 / TRIGGER_RATE_HZ - 1)
 
-static volatile uint8_t  pulse_active, edge_count, trigger_pending;
-static volatile uint8_t  amp_blanked, amp_blank_count;
+static volatile uint8_t  pulse_active;
+static volatile uint8_t  edge_count;
+static volatile uint8_t  trigger_pending;
+static volatile uint8_t  amp_blanked;
+static volatile uint8_t  amp_blank_count;
 static volatile uint8_t  listen_active;
 static volatile uint16_t listen_count;
-static volatile uint32_t pa6_start_time;
+static volatile uint32_t pulse_start_time;
 static volatile uint8_t  tof_armed;
-static volatile uint32_t pb1_last_capture;
-static volatile uint8_t  pb1_has_previous, pb1_valid_pulse_count;
+static volatile uint32_t last_capture;
+static volatile uint8_t  has_previous;
+static volatile uint8_t  valid_pulse_count;
 static volatile uint8_t  led_on_flag;
-static volatile uint16_t led_timer_count;
+static volatile uint16_t led_timer;
 
 
 #ifdef HSE_EXT
@@ -77,31 +82,31 @@ void TIM1_CC_IRQHandler(void)
     if (!LL_TIM_IsActiveFlag_CC2(TIM1)) return;
     LL_TIM_ClearFlag_CC2(TIM1);
 
-    if (trigger_pending & !pulse_active & !amp_blanked & !listen_active)
+    if (trigger_pending && !pulse_active && !amp_blanked && !listen_active)
     {
         LL_TIM_OC_SetMode(TIM3, LL_TIM_CHANNEL_CH1, LL_TIM_OCMODE_FORCED_ACTIVE);
         GPIOA->BRR = LL_GPIO_PIN_2;
 
-        pa6_start_time        = TIM3->CNT;
-        tof_armed             = 1;
-        pulse_active          = 1;
-        amp_blanked           = 1;
-        listen_active         = 1;
-        edge_count            = 0;
-        amp_blank_count       = 0;
-        listen_count          = 0;
-        pb1_has_previous      = 0;
-        pb1_valid_pulse_count = 0;
-        trigger_pending       = 0;
+        pulse_start_time    = TIM3->CNT;
+        tof_armed           = 1;
+        pulse_active        = 1;
+        amp_blanked         = 1;
+        listen_active       = 1;
+        edge_count          = 0;
+        amp_blank_count     = 0;
+        listen_count        = 0;
+        has_previous        = 0;
+        valid_pulse_count   = 0;
+        trigger_pending     = 0;
     }
 
-    if (pulse_active && ++edge_count >= PA6_PULSE_COUNT)
+    if (pulse_active && ++edge_count >= PULSE_COUNT)
     {
         LL_TIM_OC_SetMode(TIM3, LL_TIM_CHANNEL_CH1, LL_TIM_OCMODE_FORCED_INACTIVE);
         pulse_active = 0;
     }
 
-    if (amp_blanked && ++amp_blank_count >= AMP_BLANK_CYCLES)
+    if (amp_blanked && ++amp_blank_count >= BLANK_CYCLES)
     {
         GPIOA->BSRR = LL_GPIO_PIN_2;
         amp_blanked = 0;
@@ -121,7 +126,7 @@ void TIM14_IRQHandler(void)
 
     trigger_pending = 1;
 
-    if (led_timer_count && !--led_timer_count)
+    if (led_timer && !--led_timer)
         led_on_flag = 0;
 }
 
@@ -134,40 +139,40 @@ void TIM3_IRQHandler(void)
 
     uint32_t cap = TIM3->CCR4;
 
-    if (!pb1_has_previous)
+    if (!has_previous)
     {
-        pb1_last_capture = cap;
-        pb1_has_previous = 1;
+        last_capture = cap;
+        has_previous = 1;
         return;
     }
 
-    uint32_t period = (cap >= pb1_last_capture)
-        ? cap - pb1_last_capture
-        : 65536UL - pb1_last_capture + cap;
-    pb1_last_capture = cap;
+    uint32_t period = (cap >= last_capture)
+        ? cap - last_capture
+        : 65536UL - last_capture + cap;
+    last_capture = cap;
 
     if (period < FREQ_MIN_PERIOD || period > FREQ_MAX_PERIOD)
     {
-        pb1_valid_pulse_count = 0;
+        valid_pulse_count = 0;
         return;
     }
 
-    uint32_t tof = (cap >= pa6_start_time)
-        ? cap - pa6_start_time
-        : 65536UL - pa6_start_time + cap;
+    uint32_t tof = (cap >= pulse_start_time)
+        ? cap - pulse_start_time
+        : 65536UL - pulse_start_time + cap;
 
     if (tof >= DIST_MIN_TICKS && tof <= DIST_MAX_TICKS)
     {
-        if (++pb1_valid_pulse_count >= REQUIRED_PULSES)
+        if (++valid_pulse_count >= REQUIRED_PULSES)
         {
-            led_on_flag           = 1;
-            led_timer_count       = LED_ON_TIME;
-            pb1_valid_pulse_count = 0;
+            led_on_flag       = 1;
+            led_timer         = (LED_ON_TIME_MS * TRIGGER_RATE_HZ) / 1000;
+            valid_pulse_count = 0;
         }
     }
     else
     {
-        pb1_valid_pulse_count = 0;
+        valid_pulse_count = 0;
     }
 }
 
