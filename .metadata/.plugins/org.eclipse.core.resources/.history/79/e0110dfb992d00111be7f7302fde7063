@@ -1,0 +1,20 @@
+#include "main.h"
+
+void SystemClock_Config(void);
+
+int main(void)
+{
+    SystemClock_Config();
+
+    LL_AHB1_GRP1_EnableClock(LL_AHB1_GRP1_PERIPH_GPIOA);
+
+    LL_GPIO_SetPinMode(GPIOA, LL_GPIO_PIN_4, LL_GPIO_MODE_OUTPUT);
+
+    while (1)
+    {
+        GPIOA->BSRR = LL_GPIO_PIN_4;
+        LL_mDelay(500);
+        GPIOA->BRR = LL_GPIO_PIN_4;
+        LL_mDelay(500);
+    }
+}

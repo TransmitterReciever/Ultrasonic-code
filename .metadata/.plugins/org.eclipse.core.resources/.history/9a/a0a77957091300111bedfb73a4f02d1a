@@ -1,0 +1,68 @@
+/* USER CODE BEGIN Header */
+/**
+  ******************************************************************************
+  * @file           : main.c
+  * @brief          : PA4 buzzer test — 1 s ON, 3 s OFF, repeating
+  ******************************************************************************
+  */
+/* USER CODE END Header */
+#include "main.h"
+
+/* ---- Configuration ---- */
+#define SYS_CLK         48000000
+
+/* ---- System Clock: 24 MHz HSE → 48 MHz PLL ---- */
+void SystemClock_Config(void)
+{
+    LL_FLASH_SetLatency(LL_FLASH_LATENCY_1);
+    while (LL_FLASH_GetLatency() != LL_FLASH_LATENCY_1) {}
+
+    LL_RCC_HSE_Enable();
+    while (LL_RCC_HSE_IsReady() != 1) {}
+
+    LL_RCC_PLL_ConfigDomain_SYS(LL_RCC_PLLSOURCE_HSE_DIV_2, LL_RCC_PLL_MUL_4);
+    LL_RCC_PLL_Enable();
+    while (LL_RCC_PLL_IsReady() != 1) {}
+
+    LL_RCC_SetAHBPrescaler(LL_RCC_SYSCLK_DIV_1);
+    LL_RCC_SetAPB1Prescaler(LL_RCC_APB1_DIV_1);
+    LL_RCC_SetSysClkSource(LL_RCC_SYS_CLKSOURCE_PLL);
+    while (LL_RCC_GetSysClkSource() != LL_RCC_SYS_CLKSOURCE_STATUS_PLL) {}
+
+    LL_Init1msTick(SYS_CLK);
+    LL_SetSystemCoreClock(SYS_CLK);
+}
+
+int main(void)
+{
+    LL_APB1_GRP2_EnableClock(LL_APB1_GRP2_PERIPH_SYSCFG);
+    LL_APB1_GRP1_EnableClock(LL_APB1_GRP1_PERIPH_PWR);
+
+    SystemClock_Config();
+
+    /* PA4 as push-pull output */
+    LL_AHB1_GRP1_EnableClock(LL_AHB1_GRP1_PERIPH_GPIOA);
+    LL_GPIO_SetPinMode(GPIOA, LL_GPIO_PIN_4, LL_GPIO_MODE_OUTPUT);
+    LL_GPIO_ResetOutputPin(GPIOA, LL_GPIO_PIN_4);
+
+    while (1)
+    {
+        LL_GPIO_SetOutputPin(GPIOA, LL_GPIO_PIN_4);    /* ON  */
+        LL_mDelay(1000);                                /* 1 s */
+
+        LL_GPIO_ResetOutputPin(GPIOA, LL_GPIO_PIN_4);  /* OFF */
+        LL_mDelay(3000);                                /* 3 s */
+    }
+}
+
+void Error_Handler(void)
+{
+    __disable_irq();
+    while (1) {}
+}
+
+#ifdef USE_FULL_ASSERT
+void assert_failed(uint8_t *file, uint32_t line)
+{
+}
+#endif

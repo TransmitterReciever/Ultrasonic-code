@@ -1,0 +1,326 @@
+/* USER CODE BEGIN Header */
+/**
+  ******************************************************************************
+  * @file           : main.c
+  * @brief          : DEBUG — ToF check only, REQUIRED_PULSES=1, no freq check
+  *                   If LED lights with object < 1 m, ToF path is working.
+  ******************************************************************************
+  */
+/* USER CODE END Header */
+#include "main.h"
+
+/* USER CODE BEGIN 0 */
+
+/* ===================== State Machine ===================== */
+volatile uint8_t pulse_active = 0;
+volatile uint8_t edge_count = 0;
+volatile uint8_t trigger_pending = 0;
+
+/* PA2 independent control */
+volatile uint8_t pa2_active = 0;
+volatile uint8_t pa2_edge_count = 0;
+
+/* ================= PA6→PB1 Time-of-Flight Measurement ================ */
+volatile uint32_t pa6_start_time = 0;
+volatile uint8_t  tof_armed = 0;
+volatile uint8_t  pb1_valid_pulse_count = 0;
+
+/* LED control flags */
+volatile uint8_t  led_on_flag = 0;
+volatile uint16_t led_timer_count = 0;
+
+/*______________CONFIGURATION______________*/
+
+#define SYS_CLK             48000000
+#define FREQUENCY_HZ        67000
+
+#define HSE_EXT             1
+#define REQUIRED_PULSES     1               /* DEBUG: just 1 echo to trigger     */
+#define LED_CONST           3
+#define LED_ON_TIME         (LED_CONST * 1)
+#define PA6_PULSE_COUNT     4
+#define PA2_PULSE_COUNT     100
+
+#define TRIGGER_FREQ_HZ     3
+#define TIM14_PRESCALER     (SYS_CLK / 1000UL - 1)
+#define TIM14_ARR           (1000UL / TRIGGER_FREQ_HZ - 1)
+
+#define TIM3_PRESCALER      15
+#define TIM3_TICK_HZ        (SYS_CLK / (TIM3_PRESCALER + 1))
+#define TARGET_PERIOD       (SYS_CLK / FREQUENCY_HZ)
+
+#define TICKS_PER_METRE     (TIM3_TICK_HZ * 2UL / 343UL)
+#define DIST_THRESHOLD_CM   100
+#define DIST_MAX_TICKS      (TICKS_PER_METRE * DIST_THRESHOLD_CM / 100UL)
+#define DIST_MIN_CM         5
+#define DIST_MIN_TICKS      (TICKS_PER_METRE * DIST_MIN_CM / 100UL)
+
+
+#ifdef HSE_EXT
+void SystemClock_Config(void)
+{
+    LL_FLASH_SetLatency(LL_FLASH_LATENCY_1);
+    while(LL_FLASH_GetLatency() != LL_FLASH_LATENCY_1){}
+
+    LL_RCC_HSE_Enable();
+    while(LL_RCC_HSE_IsReady() != 1){}
+
+    LL_RCC_PLL_ConfigDomain_SYS(LL_RCC_PLLSOURCE_HSE_DIV_2, LL_RCC_PLL_MUL_4);
+    LL_RCC_PLL_Enable();
+    while(LL_RCC_PLL_IsReady() != 1){}
+
+    LL_RCC_SetAHBPrescaler(LL_RCC_SYSCLK_DIV_1);
+    LL_RCC_SetAPB1Prescaler(LL_RCC_APB1_DIV_1);
+    LL_RCC_SetSysClkSource(LL_RCC_SYS_CLKSOURCE_PLL);
+    while(LL_RCC_GetSysClkSource() != LL_RCC_SYS_CLKSOURCE_STATUS_PLL){}
+
+    LL_Init1msTick(SYS_CLK);
+    LL_SetSystemCoreClock(SYS_CLK);
+}
+#else
+void SystemClock_Config(void)
+{
+    LL_RCC_HSI_Enable();
+    while (!LL_RCC_HSI_IsReady());
+
+    LL_RCC_PLL_ConfigDomain_SYS(LL_RCC_PLLSOURCE_HSI_DIV_2, LL_RCC_PLL_MUL_12);
+    LL_RCC_PLL_Enable();
+    while (!LL_RCC_PLL_IsReady());
+
+    LL_FLASH_SetLatency(LL_FLASH_LATENCY_1);
+
+    LL_RCC_SetAHBPrescaler(LL_RCC_SYSCLK_DIV_1);
+    LL_RCC_SetSysClkSource(LL_RCC_SYS_CLKSOURCE_PLL);
+    while (LL_RCC_GetSysClkSource() != LL_RCC_SYS_CLKSOURCE_STATUS_PLL);
+
+    LL_Init1msTick(SYS_CLK);
+    SystemCoreClock = SYS_CLK;
+}
+#endif
+
+void GPIO_Config(void)
+{
+    LL_AHB1_GRP1_EnableClock(LL_AHB1_GRP1_PERIPH_GPIOA);
+    LL_AHB1_GRP1_EnableClock(LL_AHB1_GRP1_PERIPH_GPIOB);
+
+    /* PA9 – TIM1_CH2 PWM carrier */
+    LL_GPIO_SetPinMode(GPIOA, LL_GPIO_PIN_9, LL_GPIO_MODE_ALTERNATE);
+    LL_GPIO_SetAFPin_8_15(GPIOA, LL_GPIO_PIN_9, LL_GPIO_AF_2);
+    LL_GPIO_SetPinSpeed(GPIOA, LL_GPIO_PIN_9, LL_GPIO_SPEED_FREQ_HIGH);
+
+    /* PA6 – TIM3_CH1 pulse output (transmit burst) */
+    LL_GPIO_SetPinMode(GPIOA, LL_GPIO_PIN_6, LL_GPIO_MODE_ALTERNATE);
+    LL_GPIO_SetAFPin_0_7(GPIOA, LL_GPIO_PIN_6, LL_GPIO_AF_1);
+
+    /* PA2 – enable-bar output (active LOW) */
+    LL_GPIO_SetPinMode(GPIOA, LL_GPIO_PIN_2, LL_GPIO_MODE_OUTPUT);
+    LL_GPIO_SetOutputPin(GPIOA, LL_GPIO_PIN_2);
+
+    /* PA4 – LED / buzzer */
+    LL_GPIO_SetPinMode(GPIOA, LL_GPIO_PIN_4, LL_GPIO_MODE_OUTPUT);
+    LL_GPIO_ResetOutputPin(GPIOA, LL_GPIO_PIN_4);
+
+    /* PB1 – TIM3_CH4 input capture (echo) */
+    LL_GPIO_SetPinMode(GPIOB, LL_GPIO_PIN_1, LL_GPIO_MODE_ALTERNATE);
+    LL_GPIO_SetAFPin_0_7(GPIOB, LL_GPIO_PIN_1, LL_GPIO_AF_1);
+    LL_GPIO_SetPinPull(GPIOB, LL_GPIO_PIN_1, LL_GPIO_PULL_DOWN);
+}
+
+void TIM1_Config(void)
+{
+    LL_APB1_GRP2_EnableClock(LL_APB1_GRP2_PERIPH_TIM1);
+
+    LL_TIM_SetPrescaler(TIM1, 0);
+    LL_TIM_SetAutoReload(TIM1, TARGET_PERIOD);
+    LL_TIM_OC_SetCompareCH2(TIM1, TARGET_PERIOD / 2);
+
+    LL_TIM_OC_SetMode(TIM1, LL_TIM_CHANNEL_CH2, LL_TIM_OCMODE_PWM1);
+    LL_TIM_CC_EnableChannel(TIM1, LL_TIM_CHANNEL_CH2);
+    LL_TIM_EnableAllOutputs(TIM1);
+
+    LL_TIM_EnableIT_CC2(TIM1);
+    NVIC_SetPriority(TIM1_CC_IRQn, 0);
+    NVIC_EnableIRQ(TIM1_CC_IRQn);
+
+    LL_TIM_EnableCounter(TIM1);
+}
+
+void TIM3_Config(void)
+{
+    LL_APB1_GRP1_EnableClock(LL_APB1_GRP1_PERIPH_TIM3);
+
+    LL_TIM_SetPrescaler(TIM3, TIM3_PRESCALER);
+    LL_TIM_SetAutoReload(TIM3, 65535);
+
+    /* CH1 – PA6 burst output */
+    LL_TIM_OC_SetMode(TIM3, LL_TIM_CHANNEL_CH1, LL_TIM_OCMODE_INACTIVE);
+    LL_TIM_CC_EnableChannel(TIM3, LL_TIM_CHANNEL_CH1);
+
+    /* CH4 – PB1 echo input capture, RISING edge */
+    LL_TIM_IC_SetActiveInput(TIM3, LL_TIM_CHANNEL_CH4, LL_TIM_ACTIVEINPUT_DIRECTTI);
+    LL_TIM_IC_SetPolarity(TIM3, LL_TIM_CHANNEL_CH4, LL_TIM_IC_POLARITY_RISING);
+    LL_TIM_CC_EnableChannel(TIM3, LL_TIM_CHANNEL_CH4);
+
+    LL_TIM_EnableIT_CC4(TIM3);
+    NVIC_EnableIRQ(TIM3_IRQn);
+
+    LL_TIM_EnableCounter(TIM3);
+}
+
+void TIM14_Config(void)
+{
+    LL_APB1_GRP1_EnableClock(LL_APB1_GRP1_PERIPH_TIM14);
+
+    LL_TIM_SetPrescaler(TIM14, TIM14_PRESCALER);
+    LL_TIM_SetAutoReload(TIM14, TIM14_ARR);
+
+    LL_TIM_EnableIT_UPDATE(TIM14);
+    NVIC_EnableIRQ(TIM14_IRQn);
+
+    LL_TIM_EnableCounter(TIM14);
+}
+
+/* ============================================================
+ * TIM1 CH2 IRQ – carrier falling edge
+ * ============================================================ */
+void TIM1_CC_IRQHandler(void)
+{
+    if (LL_TIM_IsActiveFlag_CC2(TIM1))
+    {
+        LL_TIM_ClearFlag_CC2(TIM1);
+
+        if (trigger_pending && !pulse_active && !pa2_active)
+        {
+            LL_TIM_OC_SetMode(TIM3, LL_TIM_CHANNEL_CH1, LL_TIM_OCMODE_FORCED_ACTIVE);
+            LL_GPIO_ResetOutputPin(GPIOA, LL_GPIO_PIN_2);
+
+            pa6_start_time        = LL_TIM_GetCounter(TIM3);
+            tof_armed             = 1;
+            pulse_active          = 1;
+            pa2_active            = 1;
+            edge_count            = 0;
+            pa2_edge_count        = 0;
+            pb1_valid_pulse_count = 0;
+            trigger_pending       = 0;
+        }
+
+        if (pulse_active)
+        {
+            edge_count++;
+            if (edge_count >= PA6_PULSE_COUNT)
+            {
+                LL_TIM_OC_SetMode(TIM3, LL_TIM_CHANNEL_CH1, LL_TIM_OCMODE_FORCED_INACTIVE);
+                pulse_active = 0;
+            }
+        }
+
+        if (pa2_active)
+        {
+            pa2_edge_count++;
+            if (pa2_edge_count >= PA2_PULSE_COUNT)
+            {
+                LL_GPIO_SetOutputPin(GPIOA, LL_GPIO_PIN_2);
+                pa2_active = 0;
+                tof_armed  = 0;
+            }
+        }
+    }
+}
+
+/* ============================================================
+ * TIM14 IRQ – trigger + LED timer
+ * ============================================================ */
+void TIM14_IRQHandler(void)
+{
+    if (LL_TIM_IsActiveFlag_UPDATE(TIM14))
+    {
+        LL_TIM_ClearFlag_UPDATE(TIM14);
+
+        trigger_pending = 1;
+
+        if (led_timer_count > 0)
+        {
+            led_timer_count--;
+            if (led_timer_count == 0)
+                led_on_flag = 0;
+        }
+    }
+}
+
+/* ============================================================
+ * TIM3 CH4 IRQ – PB1 echo capture
+ *
+ * DEBUG: Only Check 1 (ToF), REQUIRED_PULSES = 1
+ *        No frequency check.
+ * ============================================================ */
+void TIM3_IRQHandler(void)
+{
+    if (LL_TIM_IsActiveFlag_CC4(TIM3))
+    {
+        LL_TIM_ClearFlag_CC4(TIM3);
+
+        if (!tof_armed)
+            return;
+
+        uint32_t cap = LL_TIM_IC_GetCaptureCH4(TIM3);
+
+        /* Check 1: Time-of-flight */
+        uint32_t tof;
+        if (cap >= pa6_start_time)
+            tof = cap - pa6_start_time;
+        else
+            tof = 65536UL - pa6_start_time + cap;
+
+        if ((tof < DIST_MIN_TICKS) || (tof > DIST_MAX_TICKS))
+        {
+            pb1_valid_pulse_count = 0;
+            return;
+        }
+
+        /* Check 3: Streak (Check 2 disabled for debug) */
+        pb1_valid_pulse_count++;
+
+        if (pb1_valid_pulse_count >= REQUIRED_PULSES)
+        {
+            led_on_flag           = 1;
+            led_timer_count       = LED_ON_TIME;
+            pb1_valid_pulse_count = 0;
+        }
+    }
+}
+
+/* USER CODE END 0 */
+
+int main(void)
+{
+    LL_APB1_GRP2_EnableClock(LL_APB1_GRP2_PERIPH_SYSCFG);
+    LL_APB1_GRP1_EnableClock(LL_APB1_GRP1_PERIPH_PWR);
+
+    NVIC_SetPriority(SysTick_IRQn, 3);
+
+    SystemClock_Config();
+    GPIO_Config();
+    TIM1_Config();
+    TIM3_Config();
+    TIM14_Config();
+
+    while (1)
+    {
+        if (led_on_flag)
+            LL_GPIO_SetOutputPin(GPIOA, LL_GPIO_PIN_4);
+        else
+            LL_GPIO_ResetOutputPin(GPIOA, LL_GPIO_PIN_4);
+    }
+}
+
+void Error_Handler(void)
+{
+    __disable_irq();
+    while (1) {}
+}
+
+#ifdef USE_FULL_ASSERT
+void assert_failed(uint8_t *file, uint32_t line)
+{
+}
+#endif

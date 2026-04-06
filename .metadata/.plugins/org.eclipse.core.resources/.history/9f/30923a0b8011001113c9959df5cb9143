@@ -1,0 +1,458 @@
+/* USER CODE BEGIN Header */
+/**
+  ******************************************************************************
+  * @file           : main.c
+  * @brief          : Main program body — Echo distance gate: 1 metre
+  *                   Measures time-of-flight from PA6 rising edge to PB1
+  *                   rising edge. LED lights when ToF corresponds to 1 m.
+  ******************************************************************************
+  * @attention
+  *
+  * Copyright (c) 2026 STMicroelectronics.
+  * All rights reserved.
+  *
+  * This software is licensed under terms that can be found in the LICENSE file
+  * in the root directory of this software component.
+  * If no LICENSE file comes with this software, it is provided AS-IS.
+  *
+  ******************************************************************************
+  */
+/* USER CODE END Header */
+/* Includes ------------------------------------------------------------------*/
+#include "main.h"
+
+/* Private includes ----------------------------------------------------------*/
+/* USER CODE BEGIN Includes */
+
+/* USER CODE END Includes */
+
+/* Private typedef -----------------------------------------------------------*/
+/* USER CODE BEGIN PTD */
+
+/* USER CODE END PTD */
+
+/* Private define ------------------------------------------------------------*/
+/* USER CODE BEGIN PD */
+
+/* USER CODE END PD */
+
+/* Private macro -------------------------------------------------------------*/
+/* USER CODE BEGIN PM */
+
+/* USER CODE END PM */
+
+/* Private variables ---------------------------------------------------------*/
+
+/* USER CODE BEGIN PV */
+
+/* USER CODE END PV */
+
+/* Private function prototypes -----------------------------------------------*/
+
+/* USER CODE BEGIN PFP */
+
+/* USER CODE END PFP */
+
+/* Private user code ---------------------------------------------------------*/
+/* USER CODE BEGIN 0 */
+
+/* ===================== State Machine ===================== */
+volatile uint8_t pulse_active = 0;
+volatile uint8_t edge_count = 0;
+volatile uint8_t trigger_pending = 0;
+
+/* PA2 independent control */
+volatile uint8_t pa2_active = 0;
+volatile uint8_t pa2_edge_count = 0;
+
+/* ================= PA6→PB1 Time-of-Flight Measurement ================ */
+volatile uint32_t pa6_start_time = 0;        /* TIM3 count at PA6 rising edge    */
+volatile uint8_t  tof_armed = 0;             /* 1 = PA6 burst started, awaiting echo */
+volatile uint8_t  pb1_valid_pulse_count = 0;
+
+/* LED control flags */
+volatile uint8_t  led_on_flag = 0;
+volatile uint16_t led_timer_count = 0;
+
+/*______________CONFIGURATION______________*/
+
+#define SYS_CLK             48000000        /* System clock in Hz                */
+
+#define FREQUENCY_HZ        67000           /* <<< CHANGE ONLY THIS              */
+
+#define HSE_EXT             1               /* 0 = 8 MHz HSI, 1 = 24 MHz HSE    */
+#define REQUIRED_PULSES     8               /* Min valid echo pulses to trigger  */
+#define LED_CONST           3               /* CONSTANT DONT CHANGE              */
+#define LED_ON_TIME         (LED_CONST * 1) /* 1 = 1 SEC                         */
+#define PA6_PULSE_COUNT     4               /* PA6 burst duration in cycles      */
+#define PA2_PULSE_COUNT     100             /* PA2 enable-bar duration in cycles */
+
+/* ---------------------------------------------------------------
+ * TIM3 prescaler
+ *
+ * TIM3 is 16-bit (max 65 535).  At 48 MHz that overflows in ~1.37 ms,
+ * but a 1 m round-trip takes ~5.83 ms (279 883 ticks @ 48 MHz).
+ *
+ * Prescaler = 15  →  TIM3 tick = 48 MHz / 16 = 3 MHz
+ *   1 m round-trip  = 3 000 000 * 2 / 343 = 17 493 ticks  ✓ fits 16-bit
+ *   Max measurable  = 65 535 / 17 493 ≈ 3.75 m            ✓ plenty
+ * --------------------------------------------------------------- */
+#define TIM3_PRESCALER      15              /* divides SYS_CLK by (PSC+1) = 16  */
+#define TIM3_TICK_HZ        (SYS_CLK / (TIM3_PRESCALER + 1))   /* 3 000 000    */
+
+/* Auto-computed carrier period (TIM1 runs at full SYS_CLK, no change) */
+#define TARGET_PERIOD       (SYS_CLK / FREQUENCY_HZ)
+
+/* ---------------------------------------------------------------
+ * Distance gate — 1 metre ± 10 cm
+ *
+ * Speed of sound ≈ 343 m/s.
+ * Round-trip ticks per metre = TIM3_TICK_HZ * 2 / 343
+ *
+ * At 3 MHz:  3 000 000 * 2 / 343 = 17 493 ticks/m
+ * --------------------------------------------------------------- */
+#define TICKS_PER_METRE     (TIM3_TICK_HZ * 2UL / 343UL)       /* 17 493       */
+#define DIST_TARGET_CM      100                                  /* 1 metre      */
+#define DIST_TOLERANCE_CM   10                                   /* ±10 cm       */
+
+#define DIST_MIN_TICKS  (TICKS_PER_METRE * (DIST_TARGET_CM - DIST_TOLERANCE_CM) / 100UL)
+#define DIST_MAX_TICKS  (TICKS_PER_METRE * (DIST_TARGET_CM + DIST_TOLERANCE_CM) / 100UL)
+
+
+#ifdef HSE_EXT
+/* ================= System Clock (24 MHz HSE → 48 MHz PLL) ================= */
+void SystemClock_Config(void)
+{
+    LL_FLASH_SetLatency(LL_FLASH_LATENCY_1);
+    while(LL_FLASH_GetLatency() != LL_FLASH_LATENCY_1){}
+
+    LL_RCC_HSE_Enable();
+    while(LL_RCC_HSE_IsReady() != 1){}
+
+    LL_RCC_PLL_ConfigDomain_SYS(LL_RCC_PLLSOURCE_HSE_DIV_2, LL_RCC_PLL_MUL_4);
+    LL_RCC_PLL_Enable();
+    while(LL_RCC_PLL_IsReady() != 1){}
+
+    LL_RCC_SetAHBPrescaler(LL_RCC_SYSCLK_DIV_1);
+    LL_RCC_SetAPB1Prescaler(LL_RCC_APB1_DIV_1);
+    LL_RCC_SetSysClkSource(LL_RCC_SYS_CLKSOURCE_PLL);
+    while(LL_RCC_GetSysClkSource() != LL_RCC_SYS_CLKSOURCE_STATUS_PLL){}
+
+    LL_Init1msTick(SYS_CLK);
+    LL_SetSystemCoreClock(SYS_CLK);
+}
+
+#else
+/* ================= System Clock (8 MHz HSI → 48 MHz PLL) ================= */
+void SystemClock_Config(void)
+{
+    LL_RCC_HSI_Enable();
+    while (!LL_RCC_HSI_IsReady());
+
+    LL_RCC_PLL_ConfigDomain_SYS(LL_RCC_PLLSOURCE_HSI_DIV_2, LL_RCC_PLL_MUL_12);
+    LL_RCC_PLL_Enable();
+    while (!LL_RCC_PLL_IsReady());
+
+    LL_FLASH_SetLatency(LL_FLASH_LATENCY_1);
+
+    LL_RCC_SetAHBPrescaler(LL_RCC_SYSCLK_DIV_1);
+    LL_RCC_SetSysClkSource(LL_RCC_SYS_CLKSOURCE_PLL);
+    while (LL_RCC_GetSysClkSource() != LL_RCC_SYS_CLKSOURCE_STATUS_PLL);
+
+    LL_Init1msTick(SYS_CLK);
+    SystemCoreClock = SYS_CLK;
+}
+#endif /* HSE_EXT */
+
+/* ================= GPIO ================= */
+void GPIO_Config(void)
+{
+    LL_AHB1_GRP1_EnableClock(LL_AHB1_GRP1_PERIPH_GPIOA);
+    LL_AHB1_GRP1_EnableClock(LL_AHB1_GRP1_PERIPH_GPIOB);
+
+    /* PA9 – TIM1_CH2 PWM carrier */
+    LL_GPIO_SetPinMode(GPIOA, LL_GPIO_PIN_9, LL_GPIO_MODE_ALTERNATE);
+    LL_GPIO_SetAFPin_8_15(GPIOA, LL_GPIO_PIN_9, LL_GPIO_AF_2);
+    LL_GPIO_SetPinSpeed(GPIOA, LL_GPIO_PIN_9, LL_GPIO_SPEED_FREQ_HIGH);
+
+    /* PA6 – TIM3_CH1 pulse output (transmit burst) */
+    LL_GPIO_SetPinMode(GPIOA, LL_GPIO_PIN_6, LL_GPIO_MODE_ALTERNATE);
+    LL_GPIO_SetAFPin_0_7(GPIOA, LL_GPIO_PIN_6, LL_GPIO_AF_1);
+
+    /* PA2 – Complementary / enable-bar output (active LOW) */
+    LL_GPIO_SetPinMode(GPIOA, LL_GPIO_PIN_2, LL_GPIO_MODE_OUTPUT);
+    LL_GPIO_SetOutputPin(GPIOA, LL_GPIO_PIN_2);   /* idle HIGH (inactive) */
+
+    /* PA4 – LED */
+    LL_GPIO_SetPinMode(GPIOA, LL_GPIO_PIN_4, LL_GPIO_MODE_OUTPUT);
+    LL_GPIO_ResetOutputPin(GPIOA, LL_GPIO_PIN_4); /* start OFF */
+
+    /* PB1 – TIM3_CH4 input capture (echo receive) — RISING edge only */
+    LL_GPIO_SetPinMode(GPIOB, LL_GPIO_PIN_1, LL_GPIO_MODE_ALTERNATE);
+    LL_GPIO_SetAFPin_0_7(GPIOB, LL_GPIO_PIN_1, LL_GPIO_AF_1);
+    LL_GPIO_SetPinPull(GPIOB, LL_GPIO_PIN_1, LL_GPIO_PULL_DOWN);
+}
+
+/* ================= TIM1 – Carrier PWM at FREQUENCY_HZ ================= */
+void TIM1_Config(void)
+{
+    LL_APB1_GRP2_EnableClock(LL_APB1_GRP2_PERIPH_TIM1);
+
+    LL_TIM_SetPrescaler(TIM1, 0);
+    LL_TIM_SetAutoReload(TIM1, TARGET_PERIOD);
+    LL_TIM_OC_SetCompareCH2(TIM1, TARGET_PERIOD / 2);  /* 50 % duty */
+
+    LL_TIM_OC_SetMode(TIM1, LL_TIM_CHANNEL_CH2, LL_TIM_OCMODE_PWM1);
+    LL_TIM_CC_EnableChannel(TIM1, LL_TIM_CHANNEL_CH2);
+    LL_TIM_EnableAllOutputs(TIM1);
+
+    /* Interrupt on CH2 compare (falling edge of carrier) */
+    LL_TIM_EnableIT_CC2(TIM1);
+    NVIC_SetPriority(TIM1_CC_IRQn, 0);
+    NVIC_EnableIRQ(TIM1_CC_IRQn);
+
+    LL_TIM_EnableCounter(TIM1);
+}
+
+/* ================= TIM3 – PA6 output + PB1 echo capture ================= */
+/*
+ * Prescaler = 15 → tick rate = 3 MHz → 16-bit range covers ~21.8 ms
+ * which is enough for ~3.75 m round-trip.
+ *
+ * CH1 — PA6 burst (forced active/inactive, controlled by TIM1 ISR)
+ * CH4 — PB1 echo input capture, RISING edge only
+ */
+void TIM3_Config(void)
+{
+    LL_APB1_GRP1_EnableClock(LL_APB1_GRP1_PERIPH_TIM3);
+
+    LL_TIM_SetPrescaler(TIM3, TIM3_PRESCALER);
+    LL_TIM_SetAutoReload(TIM3, 65535);
+
+    /* CH1 – PA6 burst output (forced active/inactive) */
+    LL_TIM_OC_SetMode(TIM3, LL_TIM_CHANNEL_CH1, LL_TIM_OCMODE_INACTIVE);
+    LL_TIM_CC_EnableChannel(TIM3, LL_TIM_CHANNEL_CH1);
+
+    /* CH4 – PB1 echo input capture, RISING edge only */
+    LL_TIM_IC_SetActiveInput(TIM3, LL_TIM_CHANNEL_CH4, LL_TIM_ACTIVEINPUT_DIRECTTI);
+    LL_TIM_IC_SetPolarity(TIM3, LL_TIM_CHANNEL_CH4, LL_TIM_IC_POLARITY_RISING);
+    LL_TIM_CC_EnableChannel(TIM3, LL_TIM_CHANNEL_CH4);
+
+    LL_TIM_EnableIT_CC4(TIM3);
+    NVIC_EnableIRQ(TIM3_IRQn);
+
+    LL_TIM_EnableCounter(TIM3);
+}
+
+/* ================= TIM14 – 3 Hz trigger ================= */
+void TIM14_Config(void)
+{
+    LL_APB1_GRP1_EnableClock(LL_APB1_GRP1_PERIPH_TIM14);
+
+    LL_TIM_SetPrescaler(TIM14, 47999);
+    LL_TIM_SetAutoReload(TIM14, 333);
+
+    LL_TIM_EnableIT_UPDATE(TIM14);
+    NVIC_EnableIRQ(TIM14_IRQn);
+
+    LL_TIM_EnableCounter(TIM14);
+}
+
+/* ============================================================
+ * TIM1 CH2 IRQ – fires on carrier FALLING EDGE
+ * Manages PA6 burst and PA2 enable-bar.
+ *
+ * When the burst starts we also snapshot TIM3's counter as the
+ * transmit reference time (pa6_start_time) and arm the ToF
+ * measurement (tof_armed = 1).
+ * ============================================================ */
+void TIM1_CC_IRQHandler(void)
+{
+    if (LL_TIM_IsActiveFlag_CC2(TIM1))
+    {
+        LL_TIM_ClearFlag_CC2(TIM1);
+
+        /* ---- Trigger: start PA6 burst and PA2 enable-bar ---- */
+        if (trigger_pending && !pulse_active && !pa2_active)
+        {
+            LL_TIM_OC_SetMode(TIM3, LL_TIM_CHANNEL_CH1, LL_TIM_OCMODE_FORCED_ACTIVE);
+            LL_GPIO_ResetOutputPin(GPIOA, LL_GPIO_PIN_2);  /* PA2 LOW = active */
+
+            /* Record the transmit start time from TIM3 */
+            pa6_start_time = LL_TIM_GetCounter(TIM3);
+            tof_armed      = 1;
+
+            pulse_active          = 1;
+            pa2_active            = 1;
+            edge_count            = 0;
+            pa2_edge_count        = 0;
+            pb1_valid_pulse_count = 0;   /* reset streak for new burst */
+            trigger_pending       = 0;
+        }
+
+        /* ---- PA6 burst: stop after PA6_PULSE_COUNT carrier cycles ---- */
+        if (pulse_active)
+        {
+            edge_count++;
+            if (edge_count >= PA6_PULSE_COUNT)
+            {
+                LL_TIM_OC_SetMode(TIM3, LL_TIM_CHANNEL_CH1, LL_TIM_OCMODE_FORCED_INACTIVE);
+                pulse_active = 0;
+            }
+        }
+
+        /* ---- PA2 enable-bar: deassert after PA2_PULSE_COUNT cycles ---- */
+        if (pa2_active)
+        {
+            pa2_edge_count++;
+            if (pa2_edge_count >= PA2_PULSE_COUNT)
+            {
+                LL_GPIO_SetOutputPin(GPIOA, LL_GPIO_PIN_2); /* PA2 HIGH = inactive */
+                pa2_active = 0;
+                /* If no echo arrived during the window, disarm */
+                tof_armed = 0;
+            }
+        }
+    }
+}
+
+/* ============================================================
+ * TIM14 IRQ – 3 Hz
+ * Sets the burst trigger and manages the LED-on timer
+ * ============================================================ */
+void TIM14_IRQHandler(void)
+{
+    if (LL_TIM_IsActiveFlag_UPDATE(TIM14))
+    {
+        LL_TIM_ClearFlag_UPDATE(TIM14);
+
+        trigger_pending = 1;
+
+        /* LED countdown (ticks at ~3 Hz) */
+        if (led_timer_count > 0)
+        {
+            led_timer_count--;
+            if (led_timer_count == 0)
+            {
+                led_on_flag = 0;
+            }
+        }
+    }
+}
+
+/* ============================================================
+ * TIM3 CH4 IRQ – PB1 RISING edge echo capture
+ *
+ * Computes time-of-flight = (PB1 capture) – (PA6 start time)
+ * using the prescaled TIM3 (3 MHz tick).
+ *
+ * If the ToF falls within the 1-metre ± 10 cm distance window
+ * for REQUIRED_PULSES consecutive echoes → LED ON.
+ *
+ * Any out-of-range echo resets the streak counter.
+ * ============================================================ */
+void TIM3_IRQHandler(void)
+{
+    if (LL_TIM_IsActiveFlag_CC4(TIM3))
+    {
+        LL_TIM_ClearFlag_CC4(TIM3);
+
+        /* Ignore echoes if no burst has been sent */
+        if (!tof_armed)
+            return;
+
+        uint32_t cap = LL_TIM_IC_GetCaptureCH4(TIM3);
+
+        /* Time-of-flight (handles 16-bit wrap-around) */
+        uint32_t tof;
+        if (cap >= pa6_start_time)
+            tof = cap - pa6_start_time;
+        else
+            tof = 65536UL - pa6_start_time + cap;
+
+        /* ---- Distance check: is ToF within the 1-metre window? ---- */
+        if ((tof >= DIST_MIN_TICKS) && (tof <= DIST_MAX_TICKS))
+        {
+            pb1_valid_pulse_count++;
+
+            if (pb1_valid_pulse_count >= REQUIRED_PULSES)
+            {
+                led_on_flag           = 1;
+                led_timer_count       = LED_ON_TIME;
+                pb1_valid_pulse_count = 0;
+            }
+        }
+        else
+        {
+            /* Echo at wrong distance — reset streak */
+            pb1_valid_pulse_count = 0;
+        }
+    }
+}
+
+/* USER CODE END 0 */
+
+/**
+  * @brief  The application entry point.
+  * @retval int
+  */
+int main(void)
+{
+  /* USER CODE BEGIN 1 */
+  /* USER CODE END 1 */
+
+  /* MCU Configuration -------------------------------------------------------*/
+    LL_APB1_GRP2_EnableClock(LL_APB1_GRP2_PERIPH_SYSCFG);
+    LL_APB1_GRP1_EnableClock(LL_APB1_GRP1_PERIPH_PWR);
+
+  /* USER CODE BEGIN Init */
+    NVIC_SetPriority(SysTick_IRQn, 3);
+
+    SystemClock_Config();
+    GPIO_Config();
+    TIM1_Config();
+    TIM3_Config();
+    TIM14_Config();
+  /* USER CODE END Init */
+
+  /* USER CODE BEGIN SysInit */
+  /* USER CODE END SysInit */
+
+  /* USER CODE BEGIN 2 */
+  /* USER CODE END 2 */
+
+  /* Infinite loop */
+  /* USER CODE BEGIN WHILE */
+  while (1)
+  {
+    /* USER CODE END WHILE */
+    /* USER CODE BEGIN 3 */
+      if (led_on_flag)
+          LL_GPIO_SetOutputPin(GPIOA, LL_GPIO_PIN_4);
+      else
+          LL_GPIO_ResetOutputPin(GPIOA, LL_GPIO_PIN_4);
+  }
+  /* USER CODE END 3 */
+}
+
+/* USER CODE BEGIN 4 */
+/* USER CODE END 4 */
+
+/**
+  * @brief  Error handler
+  */
+void Error_Handler(void)
+{
+  /* USER CODE BEGIN Error_Handler_Debug */
+    __disable_irq();
+    while (1){}
+  /* USER CODE END Error_Handler_Debug */
+}
+
+#ifdef USE_FULL_ASSERT
+void assert_failed(uint8_t *file, uint32_t line)
+{
+  /* USER CODE BEGIN 6 */
+  /* USER CODE END 6 */
+}
+#endif /* USE_FULL_ASSERT */

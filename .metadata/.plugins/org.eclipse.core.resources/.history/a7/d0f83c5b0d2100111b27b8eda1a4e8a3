@@ -1,0 +1,292 @@
+#include "main.h"
+
+/*______________CONFIGURATION______________*/
+#define SYS_CLK             48000000    // System clock frequency in Hz
+#define FREQUENCY_HZ        67000       // Ultrasonic frequency in Hz
+#define HSE_EXT             1           // Use external oscillator (1) or internal (0)
+
+// Distance detection range
+#define DIST_MIN_CM         50         // Minimum detection distance in cm
+#define DIST_MAX_CM         500         // Maximum detection distance in cm
+
+// System parameters
+#define PULSE_COUNT         11           // Number of ultrasonic pulses to transmit
+#define BLANK_CYCLES        100         // Amplifier blanking duration (cycles)
+#define FREQ_TOLERANCE_PCT  15          // Frequency tolerance ±%
+#define TRIGGER_RATE_HZ     10          // How often to send pulses per second
+#define REQUIRED_PULSES     3       // Number of valid echoes needed before triggering LED
+#define LED_ON_TIME_MS      100        // LED on duration in milliseconds
+
+/*______________AUTO-CALCULATED______________*/
+#define TIM3_PRESCALER      15
+#define TIM3_TICK_HZ        (SYS_CLK / (TIM3_PRESCALER + 1))
+#define TARGET_PERIOD       (SYS_CLK / FREQUENCY_HZ)
+#define TICKS_PER_METRE     (TIM3_TICK_HZ * 2UL / 343UL)  // Speed of sound = 343 m/s
+
+// Distance thresholds in timer ticks
+#define DIST_MIN_TICKS      (TICKS_PER_METRE * DIST_MIN_CM / 100UL)
+#define DIST_MAX_TICKS      (TICKS_PER_METRE * DIST_MAX_CM / 100UL)
+
+// Frequency validation limits
+#define FREQ_MIN_PERIOD     (TIM3_TICK_HZ / (FREQUENCY_HZ * (100 + FREQ_TOLERANCE_PCT) / 100))
+#define FREQ_MAX_PERIOD     (TIM3_TICK_HZ / (FREQUENCY_HZ * (100 - FREQ_TOLERANCE_PCT) / 100))
+
+// Listening window (based on max distance + margin)
+#define LISTEN_CYCLES       ((DIST_MAX_TICKS + (TICKS_PER_METRE * 50 / 100)) * FREQUENCY_HZ / TIM3_TICK_HZ)
+
+#define TIM14_ARR           (1000 / TRIGGER_RATE_HZ - 1)
+
+// State variables
+static volatile uint8_t  pulse_active;
+static volatile uint8_t  edge_count;
+static volatile uint8_t  trigger_pending;
+static volatile uint8_t  amp_blanked;
+static volatile uint8_t  amp_blank_count;
+static volatile uint8_t  listen_active;
+static volatile uint16_t listen_count;
+static volatile uint32_t pulse_start_time;
+static volatile uint8_t  tof_armed;
+static volatile uint32_t last_capture;
+static volatile uint8_t  has_previous;
+static volatile uint8_t  valid_pulse_count;
+static volatile uint8_t  led_on_flag;
+static volatile uint16_t led_timer;
+
+
+#ifdef HSE_EXT
+void SystemClock_Config(void)
+{
+    LL_FLASH_SetLatency(LL_FLASH_LATENCY_1);
+    while (LL_FLASH_GetLatency() != LL_FLASH_LATENCY_1);
+
+    LL_RCC_HSE_Enable();
+    while (!LL_RCC_HSE_IsReady());
+
+    LL_RCC_PLL_ConfigDomain_SYS(LL_RCC_PLLSOURCE_HSE_DIV_2, LL_RCC_PLL_MUL_4);
+    LL_RCC_PLL_Enable();
+    while (!LL_RCC_PLL_IsReady());
+
+    LL_RCC_SetAHBPrescaler(LL_RCC_SYSCLK_DIV_1);
+    LL_RCC_SetAPB1Prescaler(LL_RCC_APB1_DIV_1);
+    LL_RCC_SetSysClkSource(LL_RCC_SYS_CLKSOURCE_PLL);
+    while (LL_RCC_GetSysClkSource() != LL_RCC_SYS_CLKSOURCE_STATUS_PLL);
+
+    LL_Init1msTick(SYS_CLK);
+    LL_SetSystemCoreClock(SYS_CLK);
+}
+#else
+void SystemClock_Config(void)
+{
+    LL_RCC_HSI_Enable();
+    while (!LL_RCC_HSI_IsReady());
+
+    LL_RCC_PLL_ConfigDomain_SYS(LL_RCC_PLLSOURCE_HSI_DIV_2, LL_RCC_PLL_MUL_12);
+    LL_RCC_PLL_Enable();
+    while (!LL_RCC_PLL_IsReady());
+
+    LL_FLASH_SetLatency(LL_FLASH_LATENCY_1);
+    LL_RCC_SetAHBPrescaler(LL_RCC_SYSCLK_DIV_1);
+    LL_RCC_SetSysClkSource(LL_RCC_SYS_CLKSOURCE_PLL);
+    while (LL_RCC_GetSysClkSource() != LL_RCC_SYS_CLKSOURCE_STATUS_PLL);
+
+    LL_Init1msTick(SYS_CLK);
+    SystemCoreClock = SYS_CLK;
+}
+#endif
+
+// TIM1 interrupt - manages pulse generation and timing windows
+void TIM1_CC_IRQHandler(void)
+{
+    if (!LL_TIM_IsActiveFlag_CC2(TIM1)) return;
+    LL_TIM_ClearFlag_CC2(TIM1);
+
+    // Start new pulse if triggered and idle
+    if (trigger_pending && !pulse_active && !amp_blanked && !listen_active)
+    {
+        LL_TIM_OC_SetMode(TIM3, LL_TIM_CHANNEL_CH1, LL_TIM_OCMODE_FORCED_ACTIVE);
+        GPIOA->BRR = LL_GPIO_PIN_2;  // Disable amplifier
+
+        pulse_start_time    = TIM3->CNT;
+        tof_armed           = 1;
+        pulse_active        = 1;
+        amp_blanked         = 1;
+        listen_active       = 1;
+        edge_count          = 0;
+        amp_blank_count     = 0;
+        listen_count        = 0;
+        has_previous        = 0;
+        valid_pulse_count   = 0;
+        trigger_pending     = 0;
+    }
+
+    // Stop pulse after required edges
+    if (pulse_active && ++edge_count >= PULSE_COUNT)
+    {
+        LL_TIM_OC_SetMode(TIM3, LL_TIM_CHANNEL_CH1, LL_TIM_OCMODE_FORCED_INACTIVE);
+        pulse_active = 0;
+    }
+
+    // Re-enable amplifier after blanking
+    if (amp_blanked && ++amp_blank_count >= BLANK_CYCLES)
+    {
+        GPIOA->BSRR = LL_GPIO_PIN_2;  // Enable amplifier
+        amp_blanked = 0;
+    }
+
+    // Close listening window
+    if (listen_active && ++listen_count >= LISTEN_CYCLES)
+    {
+        tof_armed     = 0;
+        listen_active = 0;
+    }
+}
+
+// TIM14 interrupt - triggers periodic ultrasonic pulses
+void TIM14_IRQHandler(void)
+{
+    if (!LL_TIM_IsActiveFlag_UPDATE(TIM14)) return;
+    LL_TIM_ClearFlag_UPDATE(TIM14);
+
+    trigger_pending = 1;
+
+    if (led_timer && !--led_timer)
+        led_on_flag = 0;
+}
+
+// TIM3 interrupt - processes received echoes
+void TIM3_IRQHandler(void)
+{
+    if (!LL_TIM_IsActiveFlag_CC4(TIM3)) return;
+    LL_TIM_ClearFlag_CC4(TIM3);
+
+    if (!tof_armed) return;
+
+    uint32_t cap = TIM3->CCR4;
+
+    // Need two captures to calculate period
+    if (!has_previous)
+    {
+        last_capture = cap;
+        has_previous = 1;
+        return;
+    }
+
+    // Calculate period (handle wraparound)
+    uint32_t period = (cap >= last_capture)
+        ? cap - last_capture
+        : 65536UL - last_capture + cap;
+    last_capture = cap;
+
+    // Validate frequency
+    if (period < FREQ_MIN_PERIOD || period > FREQ_MAX_PERIOD)
+    {
+        valid_pulse_count = 0;  // Reset on invalid frequency
+        return;
+    }
+
+    // Calculate time-of-flight (handle wraparound)
+    uint32_t tof = (cap >= pulse_start_time)
+        ? cap - pulse_start_time
+        : 65536UL - pulse_start_time + cap;
+
+    // Check if distance is in valid range
+    if (tof >= DIST_MIN_TICKS && tof <= DIST_MAX_TICKS)
+    {
+        if (++valid_pulse_count >= REQUIRED_PULSES)
+        {
+            led_on_flag       = 1;
+            led_timer         = (LED_ON_TIME_MS * TRIGGER_RATE_HZ) / 1000;
+            valid_pulse_count = 0;
+        }
+    }
+    else
+    {
+        valid_pulse_count = 0;  // Reset on invalid distance
+    }
+}
+
+int main(void)
+{
+    // Enable peripheral clocks
+    LL_APB1_GRP2_EnableClock(LL_APB1_GRP2_PERIPH_SYSCFG);
+    LL_APB1_GRP1_EnableClock(LL_APB1_GRP1_PERIPH_PWR);
+    SystemClock_Config();
+
+    LL_AHB1_GRP1_EnableClock(LL_AHB1_GRP1_PERIPH_GPIOA);
+    LL_AHB1_GRP1_EnableClock(LL_AHB1_GRP1_PERIPH_GPIOB);
+
+    // PA9 - TIM1_CH2 (67kHz PWM output)
+    LL_GPIO_SetPinMode(GPIOA, LL_GPIO_PIN_9, LL_GPIO_MODE_ALTERNATE);
+    LL_GPIO_SetAFPin_8_15(GPIOA, LL_GPIO_PIN_9, LL_GPIO_AF_2);
+    LL_GPIO_SetPinSpeed(GPIOA, LL_GPIO_PIN_9, LL_GPIO_SPEED_FREQ_HIGH);
+
+    // PA6 - TIM3_CH1 (Ultrasonic pulse output)
+    LL_GPIO_SetPinMode(GPIOA, LL_GPIO_PIN_6, LL_GPIO_MODE_ALTERNATE);
+    LL_GPIO_SetAFPin_0_7(GPIOA, LL_GPIO_PIN_6, LL_GPIO_AF_1);
+
+    // PA2 - Amplifier enable (start enabled)
+    LL_GPIO_SetPinMode(GPIOA, LL_GPIO_PIN_2, LL_GPIO_MODE_OUTPUT);
+    GPIOA->BSRR = LL_GPIO_PIN_2;
+
+    // PA4 - LED output (start off)
+    LL_GPIO_SetPinMode(GPIOA, LL_GPIO_PIN_4, LL_GPIO_MODE_OUTPUT);
+    GPIOA->BRR = LL_GPIO_PIN_4;
+
+    // PB1 - TIM3_CH4 (Echo input)
+    LL_GPIO_SetPinMode(GPIOB, LL_GPIO_PIN_1, LL_GPIO_MODE_ALTERNATE);
+    LL_GPIO_SetAFPin_0_7(GPIOB, LL_GPIO_PIN_1, LL_GPIO_AF_1);
+    LL_GPIO_SetPinPull(GPIOB, LL_GPIO_PIN_1, LL_GPIO_PULL_DOWN);
+
+    // TIM1 - 67kHz PWM generation
+    LL_APB1_GRP2_EnableClock(LL_APB1_GRP2_PERIPH_TIM1);
+    LL_TIM_SetPrescaler(TIM1, 0);
+    LL_TIM_SetAutoReload(TIM1, TARGET_PERIOD);
+    LL_TIM_OC_SetCompareCH2(TIM1, TARGET_PERIOD / 2);
+    LL_TIM_OC_SetMode(TIM1, LL_TIM_CHANNEL_CH2, LL_TIM_OCMODE_PWM1);
+    LL_TIM_CC_EnableChannel(TIM1, LL_TIM_CHANNEL_CH2);
+    LL_TIM_EnableAllOutputs(TIM1);
+    LL_TIM_EnableIT_CC2(TIM1);
+    NVIC_SetPriority(TIM1_CC_IRQn, 0);
+    NVIC_EnableIRQ(TIM1_CC_IRQn);
+    LL_TIM_EnableCounter(TIM1);
+
+    // TIM3 - Pulse output and echo capture
+    LL_APB1_GRP1_EnableClock(LL_APB1_GRP1_PERIPH_TIM3);
+    LL_TIM_SetPrescaler(TIM3, TIM3_PRESCALER);
+    LL_TIM_SetAutoReload(TIM3, 65535);
+    LL_TIM_OC_SetMode(TIM3, LL_TIM_CHANNEL_CH1, LL_TIM_OCMODE_INACTIVE);
+    LL_TIM_CC_EnableChannel(TIM3, LL_TIM_CHANNEL_CH1);
+    LL_TIM_IC_SetActiveInput(TIM3, LL_TIM_CHANNEL_CH4, LL_TIM_ACTIVEINPUT_DIRECTTI);
+    LL_TIM_IC_SetPolarity(TIM3, LL_TIM_CHANNEL_CH4, LL_TIM_IC_POLARITY_RISING);
+    LL_TIM_CC_EnableChannel(TIM3, LL_TIM_CHANNEL_CH4);
+    LL_TIM_EnableIT_CC4(TIM3);
+    NVIC_EnableIRQ(TIM3_IRQn);
+    LL_TIM_EnableCounter(TIM3);
+
+    // TIM14 - Trigger timer (10Hz)
+    LL_APB1_GRP1_EnableClock(LL_APB1_GRP1_PERIPH_TIM14);
+    LL_TIM_SetPrescaler(TIM14, 47999);
+    LL_TIM_SetAutoReload(TIM14, TIM14_ARR);
+    LL_TIM_EnableIT_UPDATE(TIM14);
+    NVIC_EnableIRQ(TIM14_IRQn);
+    LL_TIM_EnableCounter(TIM14);
+
+    // Main loop - control LED
+    while (1)
+    {
+        if (led_on_flag)
+            GPIOA->BSRR = LL_GPIO_PIN_4;  // LED on
+        else
+            GPIOA->BRR = LL_GPIO_PIN_4;   // LED off
+    }
+}
+
+void Error_Handler(void)
+{
+    __disable_irq();
+    while (1);
+}
+
+#ifdef USE_FULL_ASSERT
+void assert_failed(uint8_t *file, uint32_t line) {}
+#endif

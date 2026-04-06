@@ -1,0 +1,455 @@
+/* USER CODE BEGIN Header */
+/**
+  ******************************************************************************
+  * @file           : main.c
+  * @brief          : Main program body
+  ******************************************************************************
+  * @attention
+  *
+  * Copyright (c) 2026 STMicroelectronics.
+  * All rights reserved.
+  *
+  * This software is licensed under terms that can be found in the LICENSE file
+  * in the root directory of this software component.
+  * If no LICENSE file comes with this software, it is provided AS-IS.
+  *
+  ******************************************************************************
+  */
+/* USER CODE END Header */
+/* Includes ------------------------------------------------------------------*/
+#include "main.h"
+
+/* Private includes ----------------------------------------------------------*/
+/* USER CODE BEGIN Includes */
+
+/* USER CODE END Includes */
+
+/* Private typedef -----------------------------------------------------------*/
+/* USER CODE BEGIN PTD */
+
+/* USER CODE END PTD */
+
+/* Private define ------------------------------------------------------------*/
+/* USER CODE BEGIN PD */
+
+/* USER CODE END PD */
+
+/* Private macro -------------------------------------------------------------*/
+/* USER CODE BEGIN PM */
+
+/* USER CODE END PM */
+
+/* Private variables ---------------------------------------------------------*/
+
+/* USER CODE BEGIN PV */
+
+/* USER CODE END PV */
+
+/* Private function prototypes -----------------------------------------------*/
+
+/* USER CODE BEGIN PFP */
+
+/* USER CODE END PFP */
+
+/* Private user code ---------------------------------------------------------*/
+/* USER CODE BEGIN 0 */
+
+/* ===================== State Machine ===================== */
+volatile uint8_t pulse_active = 0;
+volatile uint8_t edge_count = 0;
+volatile uint8_t trigger_pending = 0;
+
+/* PA2 independent control */
+volatile uint8_t pa2_active = 0;
+volatile uint8_t pa2_edge_count = 0;
+
+/* ================= PB1 Frequency Validation ================ */
+volatile uint32_t pb1_period_start = 0;
+volatile uint32_t pb1_period_measured = 0;
+volatile uint8_t pb1_edge_count = 0;
+volatile uint8_t pb1_valid_pulse_count = 0;
+
+/* LED control flags */
+volatile uint8_t led_on_flag = 0;
+volatile uint16_t led_timer_count = 0;
+
+/* Frequency modes */
+#define FREQ_66KHZ   1
+#define FREQ_40KHZ   2
+#define FREQ_120KHZ  3
+
+/*________CONFIGURATION________*/
+#define ACTIVE_FREQ         FREQ_40KHZ      // FREQ_40KHZ FREQ_66KH FREQ_120KH
+#define HSE_EXT             1               // If 0 clock is configured for 8Mhz input and 1 for 24Mhz input
+#define REQUIRED_PULSES     2               // Min  Echo Pules to trigger led
+#define LED_CONST           3               // CONSTANT DONT CHANGE
+#define LED_ON_TIME         (LED_CONST * 1) // 1 = 1SEC
+
+#define PA6_PULSE_COUNT     2               // PA6 burst duration in carrier cycles
+#define PA2_PULSE_COUNT     20               // PA2 enable bar duration in carrier cycles (change this to adjust)
+
+#if (ACTIVE_FREQ == FREQ_66KHZ)
+
+/* ===== 66 kHz configuration ===== */
+#define FREQ_MIN_PERIOD    686     // ~70 kHz
+#define FREQ_MAX_PERIOD    800     // ~60 kHz
+#define TARGET_PERIOD      727     // ~66 kHz
+#pragma message ("[CONFIG] ACTIVE_FREQ = 66 kHz")
+
+#elif (ACTIVE_FREQ == FREQ_40KHZ)
+
+/* ===== 40 kHz configuration ===== */
+#define FREQ_MIN_PERIOD    1067    // ~45 kHz
+#define FREQ_MAX_PERIOD    1371    // ~35 kHz
+#define TARGET_PERIOD      1250    // ~40 kHz
+#pragma message ("[CONFIG] ACTIVE_FREQ = 40 kHz")
+
+#elif (ACTIVE_FREQ == FREQ_120KHZ)
+
+/* ===== 120 kHz configuration ===== */
+#define FREQ_MIN_PERIOD    350     // ~137 kHz
+#define FREQ_MAX_PERIOD    450     // ~106 kHz
+#define TARGET_PERIOD      400     // ~120 kHz
+#pragma message ("[CONFIG] ACTIVE_FREQ = 120 kHz")
+
+#else
+#error "Invalid ACTIVE_FREQ selected"
+#endif
+
+
+#ifdef HSE_EXT
+/* ================= System Clock ================= */
+void SystemClock_Config(void)
+{
+    LL_FLASH_SetLatency(LL_FLASH_LATENCY_1);
+    while(LL_FLASH_GetLatency() != LL_FLASH_LATENCY_1){
+    }
+    LL_RCC_HSE_Enable();
+
+     /* Wait till HSE is ready */
+    while(LL_RCC_HSE_IsReady() != 1){
+
+    }
+    LL_RCC_PLL_ConfigDomain_SYS(LL_RCC_PLLSOURCE_HSE_DIV_2, LL_RCC_PLL_MUL_4);
+    LL_RCC_PLL_Enable();
+
+     /* Wait till PLL is ready */
+    while(LL_RCC_PLL_IsReady() != 1){
+
+    }
+    LL_RCC_SetAHBPrescaler(LL_RCC_SYSCLK_DIV_1);
+    LL_RCC_SetAPB1Prescaler(LL_RCC_APB1_DIV_1);
+    LL_RCC_SetSysClkSource(LL_RCC_SYS_CLKSOURCE_PLL);
+
+     /* Wait till System clock is ready */
+    while(LL_RCC_GetSysClkSource() != LL_RCC_SYS_CLKSOURCE_STATUS_PLL){
+
+    }
+    LL_Init1msTick(48000000);
+    LL_SetSystemCoreClock(48000000);
+}
+
+#else
+/* ================= 8MhzHSI ================= */
+ void SystemClock_Config(void)
+ {
+     LL_RCC_HSI_Enable();
+     while (!LL_RCC_HSI_IsReady());
+
+     LL_RCC_PLL_ConfigDomain_SYS(LL_RCC_PLLSOURCE_HSI_DIV_2, LL_RCC_PLL_MUL_12);
+     LL_RCC_PLL_Enable();
+     while (!LL_RCC_PLL_IsReady());
+
+     LL_FLASH_SetLatency(LL_FLASH_LATENCY_1);
+
+     LL_RCC_SetAHBPrescaler(LL_RCC_SYSCLK_DIV_1);
+     LL_RCC_SetSysClkSource(LL_RCC_SYS_CLKSOURCE_PLL);
+     while (LL_RCC_GetSysClkSource() != LL_RCC_SYS_CLKSOURCE_STATUS_PLL);
+
+     LL_Init1msTick(48000000);
+     SystemCoreClock = 48000000;
+ }
+
+#endif // HSE_EXT
+
+/* ================= GPIO ================= */
+void GPIO_Config(void)
+{
+    LL_AHB1_GRP1_EnableClock(LL_AHB1_GRP1_PERIPH_GPIOA);
+    LL_AHB1_GRP1_EnableClock(LL_AHB1_GRP1_PERIPH_GPIOB);
+
+
+
+    /* PA9 – TIM1_CH2 PWM */
+    LL_GPIO_SetPinMode(GPIOA, LL_GPIO_PIN_9, LL_GPIO_MODE_ALTERNATE);
+    LL_GPIO_SetAFPin_8_15(GPIOA, LL_GPIO_PIN_9, LL_GPIO_AF_2);
+    LL_GPIO_SetPinSpeed(GPIOA, LL_GPIO_PIN_9, LL_GPIO_SPEED_FREQ_HIGH);
+
+    /* PA6 – TIM3_CH1 */
+    LL_GPIO_SetPinMode(GPIOA, LL_GPIO_PIN_6, LL_GPIO_MODE_ALTERNATE);
+    LL_GPIO_SetAFPin_0_7(GPIOA, LL_GPIO_PIN_6, LL_GPIO_AF_1);
+
+    /* PA2 – Complementary output */
+    LL_GPIO_SetPinMode(GPIOA, LL_GPIO_PIN_2, LL_GPIO_MODE_OUTPUT);
+    LL_GPIO_SetOutputPin(GPIOA, LL_GPIO_PIN_2);
+
+    /* PA4 – LED */
+    LL_GPIO_SetPinMode(GPIOA, LL_GPIO_PIN_4, LL_GPIO_MODE_OUTPUT);
+    LL_GPIO_ResetOutputPin(GPIOA, LL_GPIO_PIN_4);
+
+    /* PB1 – TIM3_CH4 input capture */
+    LL_GPIO_SetPinMode(GPIOB, LL_GPIO_PIN_1, LL_GPIO_MODE_ALTERNATE);
+    LL_GPIO_SetAFPin_0_7(GPIOB, LL_GPIO_PIN_1, LL_GPIO_AF_1);
+    LL_GPIO_SetPinPull(GPIOB, LL_GPIO_PIN_1, LL_GPIO_PULL_DOWN);
+
+}
+
+/* ================= TIM1 – 66 kHz PWM ================= */
+void TIM1_Config(void)
+{
+    LL_APB1_GRP2_EnableClock(LL_APB1_GRP2_PERIPH_TIM1);
+
+    LL_TIM_SetPrescaler(TIM1, 0);
+    LL_TIM_SetAutoReload(TIM1, TARGET_PERIOD);
+    LL_TIM_OC_SetCompareCH2(TIM1, TARGET_PERIOD / 2);
+
+    LL_TIM_OC_SetMode(TIM1, LL_TIM_CHANNEL_CH2, LL_TIM_OCMODE_PWM1);
+    LL_TIM_CC_EnableChannel(TIM1, LL_TIM_CHANNEL_CH2);
+    LL_TIM_EnableAllOutputs(TIM1);
+
+    /* Interrupt on CH2 compare = FALLING EDGE */
+    LL_TIM_EnableIT_CC2(TIM1);
+    NVIC_SetPriority(TIM1_CC_IRQn, 0);
+    NVIC_EnableIRQ(TIM1_CC_IRQn);
+
+    LL_TIM_EnableCounter(TIM1);
+}
+
+/* ================= TIM3 ================= */
+void TIM3_Config(void)
+{
+    LL_APB1_GRP1_EnableClock(LL_APB1_GRP1_PERIPH_TIM3);
+
+    LL_TIM_SetPrescaler(TIM3, 0);
+    LL_TIM_SetAutoReload(TIM3, 65535);  // Max for input capture
+
+    /* CH1 – Pulse output */
+    LL_TIM_OC_SetMode(TIM3, LL_TIM_CHANNEL_CH1, LL_TIM_OCMODE_INACTIVE);
+    LL_TIM_CC_EnableChannel(TIM3, LL_TIM_CHANNEL_CH1);
+
+    /* CH4 – PB1 input capture (rising edge only) */
+    LL_TIM_IC_SetActiveInput(TIM3, LL_TIM_CHANNEL_CH4, LL_TIM_ACTIVEINPUT_DIRECTTI);
+    LL_TIM_IC_SetPolarity(TIM3, LL_TIM_CHANNEL_CH4, LL_TIM_IC_POLARITY_RISING);
+    LL_TIM_CC_EnableChannel(TIM3, LL_TIM_CHANNEL_CH4);
+
+    LL_TIM_EnableIT_CC4(TIM3);
+    NVIC_EnableIRQ(TIM3_IRQn);
+
+    LL_TIM_EnableCounter(TIM3);
+}
+
+/* ================= TIM14 – 3 Hz ================= */
+void TIM14_Config(void)
+{
+    LL_APB1_GRP1_EnableClock(LL_APB1_GRP1_PERIPH_TIM14);
+
+    LL_TIM_SetPrescaler(TIM14, 47999);
+    LL_TIM_SetAutoReload(TIM14, 333);
+
+    LL_TIM_EnableIT_UPDATE(TIM14);
+    NVIC_EnableIRQ(TIM14_IRQn);
+
+    LL_TIM_EnableCounter(TIM14);
+}
+
+/* ============ TIM1 CH2 IRQ – FALLING EDGE ============ */
+void TIM1_CC_IRQHandler(void)
+{
+    if (LL_TIM_IsActiveFlag_CC2(TIM1)){
+        LL_TIM_ClearFlag_CC2(TIM1);
+
+        /* Start both PA6 and PA2 together on trigger */
+        if (trigger_pending && !pulse_active && !pa2_active){
+            LL_TIM_OC_SetMode(TIM3, LL_TIM_CHANNEL_CH1, LL_TIM_OCMODE_FORCED_ACTIVE);
+            LL_GPIO_ResetOutputPin(GPIOA, LL_GPIO_PIN_2);
+
+            pulse_active = 1;
+            pa2_active = 1;
+            edge_count = 0;
+            pa2_edge_count = 0;
+            trigger_pending = 0;
+        }
+
+        /* PA6 burst — stops at PA6_PULSE_COUNT edges */
+        if (pulse_active){
+            edge_count++;
+            if (edge_count >= PA6_PULSE_COUNT){
+                LL_TIM_OC_SetMode(TIM3, LL_TIM_CHANNEL_CH1, LL_TIM_OCMODE_FORCED_INACTIVE);
+                pulse_active = 0;
+            }
+        }
+
+        /* PA2 enable bar — stops at PA2_PULSE_COUNT edges */
+        if (pa2_active){
+            pa2_edge_count++;
+            if (pa2_edge_count >= PA2_PULSE_COUNT){
+                LL_GPIO_SetOutputPin(GPIOA, LL_GPIO_PIN_2);
+                pa2_active = 0;
+            }
+        }
+    }
+}
+
+/* ================= TIM14 IRQ – 3 Hz trigger + LED timer ================= */
+void TIM14_IRQHandler(void)
+{
+    if (LL_TIM_IsActiveFlag_UPDATE(TIM14)){
+        LL_TIM_ClearFlag_UPDATE(TIM14);
+
+        trigger_pending = 1;
+
+        // LED timer countdown (runs at ~3 Hz)
+        if (led_timer_count > 0){
+            led_timer_count--;
+            if (led_timer_count == 0){
+                led_on_flag = 0;
+            }
+        }
+    }
+}
+
+/* ================= TIM3 PB1 Capture – Rising Edge Only ================= */
+void TIM3_IRQHandler(void)
+{
+    if (LL_TIM_IsActiveFlag_CC4(TIM3)){
+        LL_TIM_ClearFlag_CC4(TIM3);
+        uint32_t cap = LL_TIM_IC_GetCaptureCH4(TIM3);
+
+        if (pb1_edge_count == 0){
+            // First edge - record start time
+            pb1_period_start = cap;
+            pb1_edge_count = 1;
+        }
+        else{
+            // Second edge - calculate period
+            if (cap >= pb1_period_start)
+                pb1_period_measured = cap - pb1_period_start;
+            else
+                pb1_period_measured = 65536 - pb1_period_start + cap;
+
+            // Check if frequency is in range (60-70 kHz)
+            if ((pb1_period_measured >= FREQ_MIN_PERIOD) && (pb1_period_measured <= FREQ_MAX_PERIOD)){
+                pb1_valid_pulse_count++;
+
+                // If we got 2 or more valid pulses, turn on LED
+                if (pb1_valid_pulse_count >= REQUIRED_PULSES){
+                    led_on_flag = 1;
+                    led_timer_count = LED_ON_TIME;  // ~1 second (3 ticks at 3Hz)
+                    pb1_valid_pulse_count = 0;  // Reset counter
+                }
+            }
+            else{
+                // Invalid frequency - reset counter
+                pb1_valid_pulse_count = 0;
+            }
+
+            // Reset for next measurement
+            pb1_edge_count = 0;
+        }
+    }
+}
+
+/* USER CODE END 0 */
+
+/**
+  * @brief  The application entry point.
+  * @retval int
+  */
+int main(void)
+{
+
+  /* USER CODE BEGIN 1 */
+
+  /* USER CODE END 1 */
+
+  /* MCU Configuration--------------------------------------------------------*/
+
+
+    LL_APB1_GRP2_EnableClock(LL_APB1_GRP2_PERIPH_SYSCFG);
+    LL_APB1_GRP1_EnableClock(LL_APB1_GRP1_PERIPH_PWR);
+
+
+  /* USER CODE BEGIN Init */
+  NVIC_SetPriority(SysTick_IRQn, 3);
+
+    SystemClock_Config();
+    GPIO_Config();
+    TIM1_Config();
+    TIM3_Config();
+    TIM14_Config();
+  /* USER CODE END Init */
+
+  /* Configure the system clock */
+  SystemClock_Config();
+
+  /* USER CODE BEGIN SysInit */
+
+  /* USER CODE END SysInit */
+
+  /* Initialize all configured peripherals */
+  /* USER CODE BEGIN 2 */
+
+  /* USER CODE END 2 */
+
+  /* Infinite loop */
+  /* USER CODE BEGIN WHILE */
+  while (1)
+  {
+    /* USER CODE END WHILE */
+
+    /* USER CODE BEGIN 3 */
+      // Simple flag-based LED control
+      if (led_on_flag){
+          LL_GPIO_SetOutputPin(GPIOA, LL_GPIO_PIN_4);
+      }
+      else{
+          LL_GPIO_ResetOutputPin(GPIOA, LL_GPIO_PIN_4);
+      }
+  }
+  /* USER CODE END 3 */
+}
+
+/* USER CODE BEGIN 4 */
+
+/* USER CODE END 4 */
+
+/**
+  * @brief  This function is executed in case of error occurrence.
+  * @retval None
+  */
+void Error_Handler(void)
+{
+  /* USER CODE BEGIN Error_Handler_Debug */
+  /* User can add his own implementation to report the HAL error return state */
+  __disable_irq();
+  while (1)
+  {
+  }
+  /* USER CODE END Error_Handler_Debug */
+}
+#ifdef USE_FULL_ASSERT
+/**
+  * @brief  Reports the name of the source file and the source line number
+  *         where the assert_param error has occurred.
+  * @param  file: pointer to the source file name
+  * @param  line: assert_param error line source number
+  * @retval None
+  */
+void assert_failed(uint8_t *file, uint32_t line)
+{
+  /* USER CODE BEGIN 6 */
+  /* User can add his own implementation to report the file name and line number,
+     ex: printf("Wrong parameters value: file %s on line %d\r\n", file, line) */
+  /* USER CODE END 6 */
+}
+#endif /* USE_FULL_ASSERT */
