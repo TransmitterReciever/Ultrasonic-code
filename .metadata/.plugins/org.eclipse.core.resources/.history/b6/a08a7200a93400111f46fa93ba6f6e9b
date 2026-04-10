@@ -412,7 +412,7 @@ int main(void)
         if (led_on_flag)
             GPIOA->BSRR = LL_GPIO_PIN_4;
         else
-            GPIOA->BRR  = LL_GPIO_PIN_4;s
+            GPIOA->BRR  = LL_GPIO_PIN_4;
 #endif
     }
 }

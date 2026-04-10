@@ -40,7 +40,7 @@
 #define BLANK_CYCLES        100 /* PA2 stays LOW for this many PA9 carrier cycles       */
 #define FREQ_TOLERANCE_PCT  15
 #define TRIGGER_RATE_HZ     20
-#define REQUIRED_PULSES     1
+#define REQUIRED_PULSES     3
 #define CONFIDENCE_WINDOW   5
 #define LED_ON_TIME_MS      200
 
@@ -412,7 +412,7 @@ int main(void)
         if (led_on_flag)
             GPIOA->BSRR = LL_GPIO_PIN_4;
         else
-            GPIOA->BRR  = LL_GPIO_PIN_4;s
+            GPIOA->BRR  = LL_GPIO_PIN_4;
 #endif
     }
 }

@@ -1,0 +1,208 @@
+#include "main.h"
+
+/* ============================================================
+ *  CONFIGURATION  — only edit values in this block
+ * ============================================================
+ *
+ *  HSE_FREQ_MHZ  8   →  8 MHz crystal  : HSE/2 × 12 = 48 MHz
+ *  HSE_FREQ_MHZ  24  →  24 MHz crystal : HSE/2 ×  4 = 48 MHz
+ *  HSE_FREQ_MHZ  0   →  internal HSI   : HSI/2 × 12 = 48 MHz
+ *
+ *  CLK_MODE   0 = PA9 LOW  (off)
+ *             1 = PA9 HIGH (static)
+ *             2 = PA9 190 kHz PWM (toggle)
+ *
+ *  AMP_MODE   0 = PA2 LOW  (amplifier off at startup)
+ *             1 = PA2 HIGH (amplifier on  at startup)
+ *
+ *  BUZZER_MODE  0 = PA4 always OFF
+ *               1 = PA4 always ON
+ *               2 = PA4 on when object detected
+ *
+ *  BUZZER_TYPE  0 = DC buzzer — PA4 driven as plain GPIO
+ *               1 = AC buzzer — PA4 driven with 3 kHz PWM
+ *                               via TIM14_CH1 (AF4)
+ * ============================================================ */
+
+#define HSE_FREQ_MHZ        8
+#define SYS_CLK             48000000
+
+#define FREQUENCY_HZ        190000
+
+#define CLK_MODE            2
+#define AMP_MODE            1
+#define BUZZER_MODE         2
+#define BUZZER_TYPE         0   /* change to 1 for AC buzzer */
+
+#define DIST_MIN_CM         50
+#define DIST_MAX_CM         250
+#define PULSE_COUNT         11
+#define BLANK_CYCLES        100
+#define FREQ_TOLERANCE_PCT  15
+#define TRIGGER_RATE_HZ     20
+#define REQUIRED_PULSES     3
+#define CONFIDENCE_WINDOW   5
+#define LED_ON_TIME_MS      200
+
+/* ============================================================
+ *  END OF CONFIGURATION
+ * ============================================================ */
+
+/* ---------- Auto-calculated — do not edit below ------------ */
+
+/* TIM1 carrier */
+#define TARGET_PERIOD       (SYS_CLK / FREQUENCY_HZ)       /* ≈ 252 counts @ 48 MHz    */
+
+/* TIM14 — trigger timer / AC buzzer PWM
+ *
+ *   BUZZER_TYPE 0 (DC): TIM14 UPDATE fires at TRIGGER_RATE_HZ
+ *     PSC = 47999  → 1 ms tick
+ *     ARR = 49     → 50 ms period = 20 Hz
+ *
+ *   BUZZER_TYPE 1 (AC): TIM14 runs at 3 kHz to drive PA4 PWM;
+ *     20 Hz trigger is derived by counting TRIGGER_COUNT IRQs
+ *     PSC = 15     → 3 MHz tick
+ *     ARR = 999    → 3000 Hz UPDATE
+ *     TRIGGER_COUNT = 3000 / 20 = 150
+ */
+#if (BUZZER_TYPE == 1)
+  #define BUZZER_FREQ_HZ    3000u
+  #define TIM14_PSC         15u
+  #define TIM14_ARR         ((SYS_CLK / (TIM14_PSC + 1u) / BUZZER_FREQ_HZ) - 1u)
+  #define TRIGGER_COUNT     (BUZZER_FREQ_HZ / TRIGGER_RATE_HZ)
+#else
+  #define TIM14_PSC         47999u
+  #define TIM14_ARR         ((1000u / TRIGGER_RATE_HZ) - 1u)
+  #define TRIGGER_COUNT     1u
+#endif
+
+/* TIM3 echo / burst (active from Stage 4 onwards) */
+#define TIM3_PSC            15u
+#define TIM3_TICK_HZ        (SYS_CLK / (TIM3_PSC + 1u))
+#define TICKS_PER_METRE     (TIM3_TICK_HZ * 2UL / 343UL)
+#define DIST_MIN_TICKS      (TICKS_PER_METRE * DIST_MIN_CM / 100UL)
+#define DIST_MAX_TICKS      (TICKS_PER_METRE * DIST_MAX_CM / 100UL)
+#define FREQ_MIN_TICKS      (TIM3_TICK_HZ / (FREQUENCY_HZ * (100u + FREQ_TOLERANCE_PCT) / 100u))
+#define FREQ_MAX_TICKS      (TIM3_TICK_HZ / (FREQUENCY_HZ * (100u - FREQ_TOLERANCE_PCT) / 100u))
+#define LISTEN_CYCLES       ((DIST_MAX_TICKS + TICKS_PER_METRE / 2UL) * FREQUENCY_HZ / TIM3_TICK_HZ)
+#define LED_HOLD_TICKS      ((LED_ON_TIME_MS * TRIGGER_RATE_HZ) / 1000u)
+
+
+/* ============================================================
+ *  STAGE 1 — Clock config + buzzer beep
+ *
+ *  Verify : buzzer beeps on/off at ~1 Hz
+ *  Fail   : try HSE_FREQ_MHZ 0 (HSI) to rule out crystal fault
+ * ============================================================ */
+
+void SystemClock_Config(void)
+{
+    LL_FLASH_SetLatency(LL_FLASH_LATENCY_1);
+    while (LL_FLASH_GetLatency() != LL_FLASH_LATENCY_1);
+
+#if (HSE_FREQ_MHZ > 0)
+    /* Try to start HSE crystal with a timeout (~100 ms at HSI speed).
+     * If it doesn't start (cold-boot crystal fault), fall back to HSI
+     * so the firmware always runs rather than hanging forever.        */
+    LL_RCC_HSE_Enable();
+    uint32_t timeout = 100000UL;
+    while (!LL_RCC_HSE_IsReady() && --timeout);
+
+    if (timeout > 0)
+    {
+        /* HSE started OK */
+  #if (HSE_FREQ_MHZ == 24)
+        LL_RCC_PLL_ConfigDomain_SYS(LL_RCC_PLLSOURCE_HSE_DIV_2, LL_RCC_PLL_MUL_4);
+  #else
+        LL_RCC_PLL_ConfigDomain_SYS(LL_RCC_PLLSOURCE_HSE_DIV_2, LL_RCC_PLL_MUL_12);
+  #endif
+    }
+    else
+    {
+        /* HSE timed out — fall back to internal HSI: HSI/2 × 12 = 48 MHz */
+        LL_RCC_HSE_Disable();
+        LL_RCC_HSI_Enable();
+        while (!LL_RCC_HSI_IsReady());
+        LL_RCC_PLL_ConfigDomain_SYS(LL_RCC_PLLSOURCE_HSI_DIV_2, LL_RCC_PLL_MUL_12);
+    }
+
+#else
+    /* HSE_FREQ_MHZ == 0: use internal HSI unconditionally */
+    LL_RCC_HSI_Enable();
+    while (!LL_RCC_HSI_IsReady());
+    LL_RCC_PLL_ConfigDomain_SYS(LL_RCC_PLLSOURCE_HSI_DIV_2, LL_RCC_PLL_MUL_12);
+#endif
+
+    LL_RCC_PLL_Enable();
+    while (!LL_RCC_PLL_IsReady());
+
+    LL_RCC_SetAHBPrescaler(LL_RCC_SYSCLK_DIV_1);
+    LL_RCC_SetAPB1Prescaler(LL_RCC_APB1_DIV_1);
+    LL_RCC_SetSysClkSource(LL_RCC_SYS_CLKSOURCE_PLL);
+    while (LL_RCC_GetSysClkSource() != LL_RCC_SYS_CLKSOURCE_STATUS_PLL);
+
+    LL_Init1msTick(SYS_CLK);
+    LL_SetSystemCoreClock(SYS_CLK);
+}
+
+
+int main(void)
+{
+    LL_APB1_GRP2_EnableClock(LL_APB1_GRP2_PERIPH_SYSCFG);
+    LL_APB1_GRP1_EnableClock(LL_APB1_GRP1_PERIPH_PWR);
+    SystemClock_Config();
+
+    LL_AHB1_GRP1_EnableClock(LL_AHB1_GRP1_PERIPH_GPIOA);
+    LL_AHB1_GRP1_EnableClock(LL_AHB1_GRP1_PERIPH_GPIOB);
+
+    /* ---- PA4 — Buzzer setup --------------------------------- */
+#if (BUZZER_TYPE == 1)
+    /* AC buzzer: PA4 → TIM14_CH1 (AF4), 3 kHz PWM */
+    LL_GPIO_SetPinMode(GPIOA, LL_GPIO_PIN_4, LL_GPIO_MODE_ALTERNATE);
+    LL_GPIO_SetAFPin_0_7(GPIOA, LL_GPIO_PIN_4, LL_GPIO_AF_4);
+    LL_GPIO_SetPinSpeed(GPIOA, LL_GPIO_PIN_4, LL_GPIO_SPEED_FREQ_HIGH);
+
+    LL_APB1_GRP1_EnableClock(LL_APB1_GRP1_PERIPH_TIM14);
+    LL_TIM_SetPrescaler(TIM14, TIM14_PSC);
+    LL_TIM_SetAutoReload(TIM14, TIM14_ARR);
+    LL_TIM_OC_SetCompareCH1(TIM14, (TIM14_ARR + 1u) / 2u);     /* 50% duty */
+    LL_TIM_OC_SetMode(TIM14, LL_TIM_CHANNEL_CH1, LL_TIM_OCMODE_FORCED_INACTIVE);
+    LL_TIM_CC_EnableChannel(TIM14, LL_TIM_CHANNEL_CH1);
+    LL_TIM_EnableAllOutputs(TIM14);
+    LL_TIM_EnableCounter(TIM14);
+
+    /* Stage 1 verification: beep on/off at ~1 Hz */
+    while (1)
+    {
+        LL_TIM_OC_SetMode(TIM14, LL_TIM_CHANNEL_CH1, LL_TIM_OCMODE_PWM1);
+        LL_mDelay(500);
+        LL_TIM_OC_SetMode(TIM14, LL_TIM_CHANNEL_CH1, LL_TIM_OCMODE_FORCED_INACTIVE);
+        LL_mDelay(500);
+    }
+
+#else
+    /* DC buzzer: PA4 as plain GPIO */
+    LL_GPIO_SetPinMode(GPIOA, LL_GPIO_PIN_4, LL_GPIO_MODE_OUTPUT);
+    GPIOA->BRR = LL_GPIO_PIN_4;    /* start silent */
+
+    /* Stage 1 verification: beep on/off at ~1 Hz */
+    while (1)
+    {
+        GPIOA->BSRR = LL_GPIO_PIN_4;
+        LL_mDelay(500);
+        GPIOA->BRR  = LL_GPIO_PIN_4;
+        LL_mDelay(500);
+    }
+#endif
+}
+
+
+void Error_Handler(void)
+{
+    __disable_irq();
+    while (1);
+}
+
+#ifdef USE_FULL_ASSERT
+void assert_failed(uint8_t *file, uint32_t line) {}
+#endif

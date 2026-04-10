@@ -32,15 +32,15 @@
 #define CLK_MODE            2
 #define AMP_MODE            1
 #define BUZZER_MODE         2
-#define BUZZER_TYPE         1   /* 0 = DC buzzer, 1 = AC buzzer */
+#define BUZZER_TYPE         0   /* 0 = DC buzzer, 1 = AC buzzer */
 
-#define DIST_MIN_CM         30
-#define DIST_MAX_CM         100
+#define DIST_MIN_CM         50
+#define DIST_MAX_CM         250
 #define PULSE_COUNT         10  /* PA6 ON duration: N full cycles of PA9 carrier        */
 #define BLANK_CYCLES        100 /* PA2 stays LOW for this many PA9 carrier cycles       */
 #define FREQ_TOLERANCE_PCT  15
 #define TRIGGER_RATE_HZ     20
-#define REQUIRED_PULSES     1
+#define REQUIRED_PULSES     3
 #define CONFIDENCE_WINDOW   5
 #define LED_ON_TIME_MS      200
 
@@ -412,7 +412,7 @@ int main(void)
         if (led_on_flag)
             GPIOA->BSRR = LL_GPIO_PIN_4;
         else
-            GPIOA->BRR  = LL_GPIO_PIN_4;s
+            GPIOA->BRR  = LL_GPIO_PIN_4;
 #endif
     }
 }

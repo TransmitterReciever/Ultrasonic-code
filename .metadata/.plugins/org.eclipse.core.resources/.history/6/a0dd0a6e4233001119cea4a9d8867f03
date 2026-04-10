@@ -2,17 +2,17 @@
 
 /*______________CONFIGURATION______________*/
 #define SYS_CLK             48000000
-#define FREQUENCY_HZ        215000
+#define FREQUENCY_HZ        190000
 #define HSE_EXT             1
 
-#define DIST_MIN_CM         50
-#define DIST_MAX_CM         100
+#define DIST_MIN_CM         40
+#define DIST_MAX_CM         300
 
-#define PULSE_COUNT         2
+#define PULSE_COUNT         11
 #define BLANK_CYCLES        100
 #define FREQ_TOLERANCE_PCT  15
-#define TRIGGER_RATE_HZ     30
-#define REQUIRED_PULSES     2
+#define TRIGGER_RATE_HZ     20
+#define REQUIRED_PULSES     3
 #define CONFIDENCE_WINDOW   5           /* N consecutive misses before LED off  */
 #define LED_ON_TIME_MS      200
 
