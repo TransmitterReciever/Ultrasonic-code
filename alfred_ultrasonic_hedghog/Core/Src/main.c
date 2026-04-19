@@ -50,14 +50,14 @@ static volatile uint16_t led_timer;
 #endif
 
 
-#ifdef HSE_EXT
+#if HSE_EXT
 void SystemClock_Config(void)
 {
     LL_FLASH_SetLatency(LL_FLASH_LATENCY_1);
     while (LL_FLASH_GetLatency() != LL_FLASH_LATENCY_1);
     LL_RCC_HSE_Enable();
     while (!LL_RCC_HSE_IsReady());
-    LL_RCC_PLL_ConfigDomain_SYS(LL_RCC_PLLSOURCE_HSE_DIV_2, LL_RCC_PLL_MUL_12);
+    LL_RCC_PLL_ConfigDomain_SYS(LL_RCC_PLLSOURCE_HSE_DIV_2, LL_RCC_PLL_MUL_4);
     LL_RCC_PLL_Enable();
     while (!LL_RCC_PLL_IsReady());
     LL_RCC_SetAHBPrescaler(LL_RCC_SYSCLK_DIV_1);
@@ -108,6 +108,7 @@ void TIM1_CC_IRQHandler(void)
         has_previous        = 0;
         valid_pulse_count   = 0;
         trigger_pending     = 0;
+        return;
     }
 
     if (pulse_active && ++edge_count >= PULSE_COUNT)
@@ -214,8 +215,8 @@ int main(void)
 
     LL_APB1_GRP2_EnableClock(LL_APB1_GRP2_PERIPH_TIM1);
     LL_TIM_SetPrescaler(TIM1, 0);
-    LL_TIM_SetAutoReload(TIM1, TARGET_PERIOD);
-    LL_TIM_OC_SetCompareCH2(TIM1, TARGET_PERIOD / 2);
+    LL_TIM_SetAutoReload(TIM1, TARGET_PERIOD - 1);
+    LL_TIM_OC_SetCompareCH2(TIM1, (TARGET_PERIOD - 1) / 2);
     LL_TIM_OC_SetMode(TIM1, LL_TIM_CHANNEL_CH2, LL_TIM_OCMODE_PWM1);
     LL_TIM_CC_EnableChannel(TIM1, LL_TIM_CHANNEL_CH2);
     LL_TIM_EnableAllOutputs(TIM1);
