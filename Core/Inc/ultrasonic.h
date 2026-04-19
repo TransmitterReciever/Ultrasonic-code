@@ -29,7 +29,7 @@
 #define CLOCK_HSI_8MHZ    2
 
 #ifndef CLOCK_SOURCE
-#define CLOCK_SOURCE      CLOCK_HSE_24MHZ
+#define CLOCK_SOURCE      CLOCK_HSE_8MHZ
 #endif
 
 /* System clock after PLL - always 48 MHz regardless of source */
@@ -41,12 +41,19 @@
 
 /* TX frequency on PA9 in Hz (valid range: 60 000 - 230 000) */
 #ifndef TX_FREQ_HZ
-#define TX_FREQ_HZ        40000U
+#define TX_FREQ_HZ        66000U
 #endif
 
 /* Number of TX pulses per burst on PA6 (N) */
 #ifndef TX_BURST_PULSES
-#define TX_BURST_PULSES   8U
+#define TX_BURST_PULSES   3U
+#endif
+
+/* Number of PA9 pulse durations PA2 stays LOW (M).
+ * PA2 goes LOW when PA6 goes HIGH, goes HIGH after M pulses.
+ * Can be <= or >= TX_BURST_PULSES. */
+#ifndef PA2_OFF_PULSES
+#define PA2_OFF_PULSES    TX_BURST_PULSES
 #endif
 
 /* Burst repetition rate in Hz (Y) */
@@ -139,6 +146,14 @@ typedef enum {
 /* ---------------------------------------------------------------------------
  * Public API
  * -------------------------------------------------------------------------*/
+
+/**
+ * @brief  Reconfigure system clock based on CLOCK_SOURCE define.
+ *         Call before Ultrasonic_Init() if using a different crystal than
+ *         what CubeMX was configured for.
+ * @retval 0 on success, -1 on failure
+ */
+int SystemClock_UserConfig(void);
 
 /**
  * @brief  Initialise ultrasonic subsystem. Call after MX_TIMx_Init() functions.

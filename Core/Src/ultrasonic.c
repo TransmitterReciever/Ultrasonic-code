@@ -47,6 +47,8 @@ static volatile bool     buzzer_active;
 /* TIM14 overflow tracking for 32-bit timestamps */
 static volatile uint32_t tim14_overflows;
 
+
+
 /* ---------------------------------------------------------------------------
  * Private helpers
  * -------------------------------------------------------------------------*/
@@ -124,29 +126,64 @@ void Ultrasonic_Init(void)
     /* One-pulse mode */
     htim3.Instance->CR1 |= TIM_CR1_OPM;
 
-    /* ARR = number of TX pulses in burst */
-    __HAL_TIM_SET_AUTORELOAD(&htim3, TX_BURST_PULSES);
+    /* ARR = max(TX_BURST_PULSES, PA2_OFF_PULSES) so the timer runs long
+     * enough for both PA6 burst and PA2 off-time. */
+    {
+        uint32_t arr = TX_BURST_PULSES;
+        if (PA2_OFF_PULSES > TX_BURST_PULSES)
+            arr = PA2_OFF_PULSES;
+        __HAL_TIM_SET_AUTORELOAD(&htim3, arr);
+    }
 
-    /* PWM Mode 1 on CH1 (OC1M = 110):
-     *   OC1REF = HIGH while CNT < CCR1, LOW when CNT >= CCR1.
+    /* PA6 output: PWM Mode 2 (OC1M = 111): OC1REF = HIGH when CNT >= CCR1.
+     * CCR1 = 1: PA6 goes HIGH on first PA9 edge (CNT reaches 1).
+     * PA6 forced inactive by CC1 interrupt when CNT = TX_BURST_PULSES.
+     * Note: we DON'T use CCR1 for the PA6 off-point -- we use a separate
+     * CC1 compare interrupt approach. Actually, for PA6 we continue to use
+     * the forced inactive trick in the CC1 ISR at N pulses.
      *
-     * With CCR1 = ARR = TX_BURST_PULSES:
-     *   CNT counts 0, 1, 2, ..., (N-1)  -> PA6 HIGH (N external clock edges)
-     *   CNT reaches N -> update event, OPM stops counter, PA6 goes LOW.
+     * CCR1 = 1 controls when PA6 goes HIGH (hardware-synced to first edge).
+     * CC1 interrupt at a separate count isn't possible with same channel.
+     * Instead: if M != N, we handle PA6 and PA2 differently:
+     *   - PA6: forced inactive in TIM3 CC2 ISR when CNT matches TX_BURST_PULSES
+     *   - PA2: set HIGH in TIM3 CC3 ISR when CNT matches PA2_OFF_PULSES
+     *   - Update ISR: just handles end-of-timer-period cleanup
      *
-     * Each CNT increment = one TIM1 TRGO edge = one PA9 cycle.
-     * Result: PA6 is HIGH for exactly TX_BURST_PULSES cycles of PA9. */
+     * But TIM3 has 4 channels. We use:
+     *   CH1 = PA6 output (PWM Mode 2, CCR1 = 1 for start sync)
+     *   CH2 = PA6 off-point (compare only, CCR2 = TX_BURST_PULSES, no pin)
+     *   CH3 = PA2 off-point (compare only, CCR3 = PA2_OFF_PULSES, no pin) */
     htim3.Instance->CCMR1 &= ~TIM_CCMR1_OC1M;
-    htim3.Instance->CCMR1 |= (TIM_CCMR1_OC1M_2 | TIM_CCMR1_OC1M_1); /* 110 = PWM mode 1 */
-    htim3.Instance->CCMR1 |= TIM_CCMR1_OC1PE;  /* preload enable */
-    __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_1, TX_BURST_PULSES);
+    htim3.Instance->CCMR1 |= (TIM_CCMR1_OC1M_2 | TIM_CCMR1_OC1M_1 | TIM_CCMR1_OC1M_0); /* 111 = PWM mode 2 */
+    htim3.Instance->CCMR1 &= ~TIM_CCMR1_OC1PE;  /* disable preload so mode switch is immediate */
+    __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_1, 1); /* PA6 HIGH when CNT >= 1 */
+
+    /* Normal polarity (CC1P = 0): pin follows OC1REF */
+    htim3.Instance->CCER &= ~TIM_CCER_CC1P;
 
     /* Enable CH1 output */
     htim3.Instance->CCER |= TIM_CCER_CC1E;
 
-    /* Enable TIM3 update interrupt only (burst end).
-     * Burst start (PA2 LOW) is handled in TIM17 ISR when TIM3 is re-armed. */
+    /* Force output LOW initially (Forced Inactive = OC1M 100) */
+    htim3.Instance->CCMR1 &= ~TIM_CCMR1_OC1M;
+    htim3.Instance->CCMR1 |= TIM_CCMR1_OC1M_2;  /* 100 = Forced Inactive */
+
+    /* CH2: compare-only for PA6 off-point at TX_BURST_PULSES.
+     * No pin output, just CC2 interrupt. */
+    __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_2, TX_BURST_PULSES);
+    /* OC2M = 000 (frozen/timing), no output */
+    htim3.Instance->CCMR1 &= ~TIM_CCMR1_OC2M;
+
+    /* CH3: compare-only for PA2 off-point at PA2_OFF_PULSES.
+     * No pin output, just CC3 interrupt. */
+    __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_3, PA2_OFF_PULSES);
+    /* OC3M = 000 (frozen/timing), no output */
+    htim3.Instance->CCMR2 &= ~TIM_CCMR2_OC3M;
+
+    /* Enable interrupts: update (timer end), CC2 (PA6 off), CC3 (PA2 off) */
     __HAL_TIM_ENABLE_IT(&htim3, TIM_IT_UPDATE);
+    __HAL_TIM_ENABLE_IT(&htim3, TIM_IT_CC2);
+    __HAL_TIM_ENABLE_IT(&htim3, TIM_IT_CC3);
 
     /* ---- TIM17: periodic burst trigger at TX_REPEAT_RATE_HZ ---- */
     {
@@ -233,12 +270,23 @@ void Ultrasonic_StartTX(void)
     /* Start TIM17 periodic interrupt (burst trigger) */
     HAL_TIM_Base_Start_IT(&htim17);
 
-    /* Arm TIM3 for the first burst - TIM17 will re-arm it subsequently.
-     * Generate an update event to load shadow registers, then enable. */
+    /* Arm TIM3 for the first burst - TIM17 will re-arm it subsequently. */
+    htim3.Instance->CR1 &= ~TIM_CR1_OPM;
+    htim3.Instance->CNT = 0;
     htim3.Instance->EGR = TIM_EGR_UG;
     __HAL_TIM_CLEAR_FLAG(&htim3, TIM_FLAG_UPDATE);
+    htim3.Instance->CR1 |= TIM_CR1_OPM;
 
-    /* Set PA2 LOW for first burst start */
+    /* Switch PA6 to PWM Mode 2 for first burst (hardware-synced to PA9) */
+    if (PA6_MODE == PIN_MODE_NORMAL)
+    {
+        htim3.Instance->CCMR1 = (htim3.Instance->CCMR1 & ~TIM_CCMR1_OC1M)
+                                | TIM_CCMR1_OC1M_2 | TIM_CCMR1_OC1M_1 | TIM_CCMR1_OC1M_0; /* 111 = PWM mode 2 */
+    }
+
+    /* PA2 goes LOW for first burst start via DMA when TIM17 fires,
+     * but for the very first burst we set it manually since TIM17
+     * hasn't fired yet. */
     if (PA2_MODE == PIN_MODE_NORMAL)
     {
         GPIOA->BRR = GPIO_PIN_2;
@@ -369,21 +417,63 @@ void Ultrasonic_BuzzerUpdate(void)
 
 void Ultrasonic_TIM3_IRQHandler(void)
 {
-    /* Update event: burst end (counter reached ARR, OPM stops timer).
-     * PA6 has just gone LOW (PWM mode 1, CNT >= CCR1 at overflow). */
-    if (htim3.Instance->SR & TIM_SR_UIF)
-    {
-        htim3.Instance->SR = ~TIM_SR_UIF;  /* clear flag */
+    uint32_t sr = htim3.Instance->SR;
 
-        /* PA2 goes HIGH when PA6 goes LOW (burst end) */
-        if (PA2_MODE == PIN_MODE_NORMAL)
+    /* CC2 event: PA6 off-point (CNT matched TX_BURST_PULSES) */
+    if (sr & TIM_SR_CC2IF)
+    {
+        htim3.Instance->SR = ~TIM_SR_CC2IF;
+
+        /* Force PA6 LOW by switching to Forced Inactive mode */
+        if (PA6_MODE == PIN_MODE_NORMAL)
         {
-            GPIOA->BSRR = GPIO_PIN_2;  /* direct register write for speed */
+            htim3.Instance->CCMR1 = (htim3.Instance->CCMR1 & ~TIM_CCMR1_OC1M)
+                                    | TIM_CCMR1_OC1M_2;  /* 100 = Forced Inactive */
         }
 
         /* Record TX burst end timestamp from TIM14 (32-bit) for ToF calculation */
         tx_burst_end_tick32 = TIM14_GetTimestamp32(htim14.Instance->CNT);
         tx_burst_ended = true;
+    }
+
+    /* CC3 event: PA2 off-point (CNT matched PA2_OFF_PULSES) */
+    if (sr & TIM_SR_CC3IF)
+    {
+        htim3.Instance->SR = ~TIM_SR_CC3IF;
+
+        /* PA2 goes HIGH after M pulses */
+        if (PA2_MODE == PIN_MODE_NORMAL)
+        {
+            GPIOA->BSRR = GPIO_PIN_2;
+        }
+    }
+
+    /* Update event: timer period end (ARR reached, OPM stops timer).
+     * Both PA6 and PA2 should already be handled by CC2/CC3.
+     * This just ensures cleanup if M == N == ARR. */
+    if (sr & TIM_SR_UIF)
+    {
+        htim3.Instance->SR = ~TIM_SR_UIF;
+
+        /* Force PA6 LOW if not already done (when N == ARR) */
+        if (PA6_MODE == PIN_MODE_NORMAL)
+        {
+            htim3.Instance->CCMR1 = (htim3.Instance->CCMR1 & ~TIM_CCMR1_OC1M)
+                                    | TIM_CCMR1_OC1M_2;  /* 100 = Forced Inactive */
+        }
+
+        /* Force PA2 HIGH if not already done (when M == ARR) */
+        if (PA2_MODE == PIN_MODE_NORMAL)
+        {
+            GPIOA->BSRR = GPIO_PIN_2;
+        }
+
+        /* Record timestamp if not already done by CC2 */
+        if (!tx_burst_ended)
+        {
+            tx_burst_end_tick32 = TIM14_GetTimestamp32(htim14.Instance->CNT);
+            tx_burst_ended = true;
+        }
     }
 }
 
@@ -435,12 +525,21 @@ void Ultrasonic_TIM17_IRQHandler(void)
          * Reset counter, clear flags, then enable. */
         if (PA6_MODE == PIN_MODE_NORMAL)
         {
+            /* Temporarily disable OPM so UG doesn't stop the timer */
+            htim3.Instance->CR1 &= ~TIM_CR1_OPM;
             htim3.Instance->CNT = 0;
-            htim3.Instance->SR  = 0;  /* clear all flags */
+            htim3.Instance->EGR = TIM_EGR_UG;  /* load preloaded values */
+            htim3.Instance->SR  = 0;  /* clear all flags including UIF from UG */
+            htim3.Instance->CR1 |= TIM_CR1_OPM;
 
-            /* PA2 goes LOW at burst start (PA6 is about to go HIGH).
-             * We set PA2 LOW here, just before enabling TIM3.
-             * The first TIM1 TRGO edge will start the burst (PA6 HIGH). */
+            /* Switch PA6 back to PWM Mode 2 so it goes HIGH on first clock edge */
+            if (PA6_MODE == PIN_MODE_NORMAL)
+            {
+                htim3.Instance->CCMR1 = (htim3.Instance->CCMR1 & ~TIM_CCMR1_OC1M)
+                                        | TIM_CCMR1_OC1M_2 | TIM_CCMR1_OC1M_1 | TIM_CCMR1_OC1M_0; /* 111 = PWM mode 2 */
+            }
+
+            /* PA2 goes LOW at burst start */
             if (PA2_MODE == PIN_MODE_NORMAL)
             {
                 GPIOA->BRR = GPIO_PIN_2;
